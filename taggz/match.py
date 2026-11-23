@@ -59,6 +59,7 @@ class TrackPlan:
     path: Path
     tags: dict[str, list[str]]
     sources: list[str]
+    withheld: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -93,6 +94,12 @@ class Proposal:
                         if item.track.tags.get(k) != v
                     },
                     removed=sorted(set(item.track.tags) - set(item.tags)),
+                    previous_fields={
+                        k: v
+                        for k, v in item.track.tags.items()
+                        if item.tags.get(k) != v
+                    },
+                    withheld=item.withheld,
                 )
                 for item in self.tracks
             ],
@@ -140,21 +147,25 @@ def exact_cd_toc(release: Release, edition: Edition) -> bool:
     )
 
 
-def layout_matches(
+def layout_issue(
     release: Release, edition: Edition, *, exact_toc: bool = False
-) -> bool:
+) -> str | None:
     if len(release.tracks) != len(edition.tracks):
-        return False
+        return f"track count differs: staging has {len(release.tracks)}, candidate has {len(edition.tracks)}"
     variant = supported_variant(release, edition)
     typos = 0
     for source, target in zip(release.tracks, edition.tracks, strict=True):
         if (source.disc, source.number) != (target.disc, target.number):
-            return False
+            return (
+                f"track position differs: staging disc {source.disc} track {source.number:02d}, "
+                f"candidate disc {target.disc} track {target.number:02d}"
+            )
         left, right = track_key(source.title), track_key(target.title)
         if left == right or (variant and right == left + variant):
             continue
+        mismatch = f"disc {source.disc} track {source.number:02d} title differs: {source.title!r} vs {target.title!r}"
         if not exact_toc:
-            return False
+            return mismatch
         left, right = cd_title_key(source.title), cd_title_key(target.title)
         if left == right:
             continue
@@ -165,9 +176,9 @@ def layout_matches(
             or left.endswith("live") != right.endswith("live")
             or SequenceMatcher(None, left, right).ratio() < 0.94
         ):
-            return False
+            return mismatch
         typos += 1
-    return True
+    return None
 
 
 def barcode_matches(release: Release, edition: Edition) -> bool:
@@ -180,31 +191,46 @@ def barcode_matches(release: Release, edition: Edition) -> bool:
     )
 
 
-def score(release: Release, edition: Edition) -> Match | None:
-    if not edition.artist or not media_compatible(release, edition):
-        return None
+def score(
+    release: Release, edition: Edition, *, rejection: list[str] | None = None
+) -> Match | None:
+    def reject(reason: str) -> None:
+        if rejection is not None:
+            rejection.append(reason)
+
+    if not edition.artist:
+        return reject("candidate has no album artist")
+    if not media_compatible(release, edition):
+        return reject(
+            f"medium does not match: staging is {release.medium or 'unconfirmed'}, "
+            f"candidate is {edition.medium or 'unconfirmed'}"
+        )
     aliases = {normalize(name) for name in {edition.artist, *edition.aliases}}
     variant = supported_variant(release, edition)
     title_matches_edition = title_matches(release.title, edition.title) or (
         variant and normalize(release.title) == normalize(edition.title) + variant
     )
-    if normalize(release.artist) not in aliases or not title_matches_edition:
-        return None
+    if normalize(release.artist) not in aliases:
+        return reject(f"album artist differs: {release.artist!r} vs {edition.artist!r}")
+    if not title_matches_edition:
+        return reject(f"release title differs: {release.title!r} vs {edition.title!r}")
     toc = exact_cd_toc(release, edition)
-    if not layout_matches(release, edition, exact_toc=toc):
-        return None
+    if issue := layout_issue(release, edition, exact_toc=toc):
+        return reject(issue)
     if (
         release.barcode
         and edition.tags.get("barcode")
         and not barcode_matches(release, edition)
     ):
-        return None
+        return reject(
+            f"barcode differs: {release.barcode} vs {', '.join(edition.tags['barcode'])}"
+        )
     durations = [
-        abs(track.seconds - entry.seconds)
+        (abs(track.seconds - entry.seconds), track.disc, track.number)
         for track, entry in zip(release.tracks, edition.tracks)
         if entry.seconds is not None
     ]
-    delta = max(durations, default=0)
+    delta, max_disc, max_track = max(durations, default=(0, 0, 0))
     have_durations = len(durations) == len(release.tracks)
     isrc_votes = 0
     for track, entry in zip(release.tracks, edition.tracks):
@@ -246,7 +272,10 @@ def score(release: Release, edition: Edition) -> Match | None:
             edition, 55, "HDtracks provenance, year, track order and durations", delta
         )
     if delta > 4:
-        return None
+        return reject(
+            f"disc {max_disc} track {max_track:02d} duration differs by {delta:.2f}s "
+            "(more than the allowed 4s)"
+        )
     if (barcode or catalog or saved_id) and (
         have_durations or isrc_votes or barcode and catalog or saved_id
     ):
@@ -270,7 +299,34 @@ def score(release: Release, edition: Edition) -> Match | None:
         return Match(
             edition, 50, "digital release date, track order and durations", delta
         )
-    return None
+    hints = []
+    if release.tocs and not toc:
+        hints.append("CD disc ID did not match")
+    elif toc and delta > 3:
+        hints.append(
+            f"disc {max_disc} track {max_track:02d} is {delta:.2f}s apart "
+            "(3s allowed for an exact CD TOC match)"
+        )
+    if release.barcode and not barcode:
+        hints.append("candidate did not confirm the barcode")
+    if release.catalog and not catalog:
+        hints.append("catalog number did not match")
+    if not have_durations:
+        hints.append(
+            f"durations available for {len(durations)}/{len(release.tracks)} tracks"
+        )
+    if release.medium == "Digital Media":
+        hints.append(f"{isrc_votes}/{len(release.tracks)} ISRCs matched")
+        if not same_date:
+            hints.append("exact release date could not be confirmed")
+        elif delta > 1.2:
+            hints.append(
+                f"largest duration difference was {delta:.2f}s (1.2s allowed for a date match)"
+            )
+    return reject(
+        "track list matches, but release identity could not be verified"
+        + (f" ({'; '.join(hints)})" if hints else "")
+    )
 
 
 class Library:
@@ -393,9 +449,16 @@ def select(matches: list[Match]) -> tuple[list[Match], str]:
         or "" in groups
         or agreed_recordings * 5 < len(recordings[0]) * 4
     ):
-        raise Review(
-            "multiple plausible editions; verify the pressing, catalog number, or identifiers"
-        )
+        if best < 100:
+            detail = "available evidence does not distinguish them"
+        elif len(groups) != 1 or "" in groups:
+            detail = "their release groups disagree or are missing"
+        else:
+            detail = (
+                f"only {agreed_recordings}/{len(recordings[0])} recording IDs agree "
+                "across the CD pressings"
+            )
+        raise Review(f"{len(winners)} equally supported editions; {detail}")
     return winners, "shared CD table of contents and recording agreement"
 
 
@@ -432,15 +495,50 @@ def album_date(winners: list[Match], fallback: str) -> str:
     raise Review("verified editions do not establish a release year")
 
 
-def propose(release: Release, library: Library, catalog: Catalog) -> Proposal:
+def propose(
+    release: Release, library: Library, catalog: Catalog, diagnostics: dict
+) -> Proposal:
     names, references = library.find(release)
+    diagnostics["library_matches"] = [path.name for path in names]
+    diagnostics["unreadable_library_matches"] = [
+        path.name for path in names if library.cache.get(path) is None
+    ]
     locals_ = [from_library(r) for r in references]
+    candidates = diagnostics["candidates"] = []
+
+    def assess(edition: Edition) -> Match | None:
+        rejection = []
+        match = score(release, edition, rejection=rejection)
+        candidates.append(
+            {
+                "source": edition.source,
+                "artist": edition.artist,
+                "title": edition.title,
+                "date": edition.date,
+                "medium": edition.medium,
+                "track_count": len(edition.tracks),
+                "barcodes": edition.tags.get("barcode", []),
+                "catalog_numbers": edition.tags.get("catalognumber", []),
+                "exact_cd_toc": exact_cd_toc(release, edition),
+                "decision": "qualified" if match else "rejected",
+                "reason": match.evidence if match else rejection[0],
+                "maximum_duration_difference_seconds": (
+                    round(match.delta, 3)
+                    if match
+                    and any(entry.seconds is not None for entry in edition.tracks)
+                    else None
+                ),
+            }
+        )
+        return match
+
     # Full copy of digital edition IDs requires identity with the release already
     # in the library. A shared track program alone only supports recording credits.
     same_library = [
-        item
+        match
         for item in locals_
-        if release.medium == item.medium
+        if (match := assess(item))
+        and release.medium == item.medium
         and (
             barcode_matches(release, item)
             or any(
@@ -449,28 +547,38 @@ def propose(release: Release, library: Library, catalog: Catalog) -> Proposal:
                 for key in EDITION_IDS - {"barcode", "catalognumber"}
             )
         )
-        and score(release, item)
     ]
+    same_library_sources = {m.edition.source for m in same_library}
+    for item in candidates:
+        if (
+            item["decision"] == "qualified"
+            and item["source"] not in same_library_sources
+        ):
+            item["decision"] = "reference only"
+            item["reason"] += ", but no shared release barcode or edition ID"
     mb = catalog.musicbrainz(release)
-    links = [edition.lookup for edition in mb if score(release, edition)]
+    mb_matches = [match for edition in mb if (match := assess(edition))]
+    links = [match.edition.lookup for match in mb_matches]
     discogs = catalog.discogs(release, links)
-    remote = [
-        (m, edition) for edition in mb + discogs if (m := score(release, edition))
-    ]
+    discogs_matches = [match for edition in discogs if (match := assess(edition))]
     # A linked Discogs entry augments the matching MB entry, not a second vote
     # for the same release. Its credits still have to match the track layout.
-    linked = {edition.lookup for m, edition in remote if edition.lookup}
-    matches = [m for m, edition in remote if edition.source not in linked]
-    if not matches:
-        matches = [score(release, item) for item in same_library]
+    linked = set(links) - {""}
+    matches = mb_matches + [
+        m for m in discogs_matches if m.edition.source not in linked
+    ]
+    matches = matches or same_library
+    diagnostics["sources"] = [m.edition.source for m in matches] or [
+        item.source for item in mb + discogs
+    ]
     try:
         winners, evidence = select(matches)
-    except Review as error:
-        sources = [m.edition.source for m in matches] or [
-            edition.source for edition in mb + discogs
-        ][:12]
-        error.sources = sources
-        error.library_matches = [p.name for p in names]
+    except Review:
+        best = max((m.rank for m in matches), default=None)
+        tied = {m.edition.source for m in matches if m.rank == best}
+        for item in candidates:
+            if item["source"] in tied:
+                item["decision"] = "ambiguous"
         raise
     editions = [m.edition for m in winners]
     preferred = editions[0]
@@ -495,12 +603,11 @@ def propose(release: Release, library: Library, catalog: Catalog) -> Proposal:
     sources = [m.source for m in editions]
     supplemental = next(
         (
-            m
-            for m in discogs
+            m.edition
+            for m in discogs_matches
             if len(editions) == 1
-            and m.source == preferred.lookup
-            and m.medium == preferred.medium
-            and score(release, m)
+            and m.edition.source == preferred.lookup
+            and m.edition.medium == preferred.medium
         ),
         None,
     )
@@ -509,6 +616,21 @@ def propose(release: Release, library: Library, catalog: Catalog) -> Proposal:
             if key not in {"albumartists", "barcode", "catalognumber", "genre"}:
                 album_tags.setdefault(key, value)
         sources += [supplemental.source]
+    for item in candidates:
+        if item["source"] in sources:
+            item["decision"] = (
+                "supplemental"
+                if supplemental and item["source"] == supplemental.source
+                else "selected"
+            )
+    diagnostics["withheld_release_fields"] = sorted(
+        (EDITION_IDS | {"releasecountry"})
+        & (
+            set().union(*(m.tags for m in editions))
+            - set(album_tags)
+            - set(release.tags)
+        )
+    )
     notes = []
     if len(editions) > 1:
         notes.append(
@@ -519,6 +641,10 @@ def propose(release: Release, library: Library, catalog: Catalog) -> Proposal:
     for idx, track in enumerate(release.tracks):
         records = [m.tracks[idx] for m in editions]
         verified = common([r.tags for r in records])
+        withheld = sorted(
+            {"musicbrainz_trackid", "musicbrainz_releasetrackid", "isrc"}
+            & (set().union(*(r.tags for r in records)) - set(verified))
+        )
         title = (
             records[0].title if len({r.title for r in records}) == 1 else track.title
         )
@@ -620,7 +746,15 @@ def propose(release: Release, library: Library, catalog: Catalog) -> Proposal:
             entry_tags["musicbrainz_discid"] = [disc_id]
         parent = Path(f"Disc {track.disc}") if release.tracks[-1].disc > 1 else Path()
         name = f"{track.number:02d} - {safe_name(title, 230)}.flac"
-        tracks.append(TrackPlan(track, parent / name, entry_tags, track_sources))
+        tracks.append(
+            TrackPlan(
+                track,
+                parent / name,
+                entry_tags,
+                track_sources,
+                [key for key in withheld if key not in entry_tags],
+            )
+        )
     folder = directory_name(artist, album, date, preferred.medium, release)
     return Proposal(
         release,
@@ -629,6 +763,6 @@ def propose(release: Release, library: Library, catalog: Catalog) -> Proposal:
         sources,
         evidence,
         [p.name for p in names],
-        [item.source.removeprefix("library: ") for item in same_library],
+        [item.edition.source.removeprefix("library: ") for item in same_library],
         notes,
     )

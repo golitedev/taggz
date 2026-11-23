@@ -127,6 +127,12 @@ class Workflow(unittest.TestCase):
         )
         preview = self.run_cli(expected=1)
         self.assertEqual(preview[0]["tracks"][0]["fields"]["composer"], ["A Writer"])
+        self.assertEqual(preview[0]["input"]["track_count"], 1)
+        self.assertEqual(preview[0]["candidates"][0]["decision"], "selected")
+        self.assertEqual(
+            preview[0]["tracks"][0]["previous_fields"]["tracknumber"], ["1"]
+        )
+        self.assertNotIn("verification", preview[0])
         self.assertEqual(staged.read_bytes(), original)
         self.assertFalse((self.staging / ".taggz").exists())
         self.assertFalse((self.staging / "completed").exists())
@@ -142,6 +148,10 @@ class Workflow(unittest.TestCase):
         self.assertEqual(read_header(new)[1], gain_before)
         self.assertEqual(library.read_bytes(), library_before)
         self.assertEqual((completed / "01 - Song.lrc").read_bytes(), b"[00:00.00]Test")
+        saved = json.loads(Path(reports[0]["report_file"]).read_text())
+        self.assertEqual(saved["phase"], "completed")
+        self.assertEqual(saved["verification"]["audio_frame_hashes_matched"], 1)
+        self.assertTrue(saved["verification"]["replaygain_calculated"])
         self.assertIn(
             'FILE "01 - Song.flac" WAVE',
             (completed / "album.cue").read_text("utf-8-sig"),
@@ -184,7 +194,34 @@ class Workflow(unittest.TestCase):
         (destination / "cover.jpg").write_bytes(b"original cover")
         (report,) = self.run_cli("--apply", expected=1)
         self.assertIn("already exists", report["reason"])
+        self.assertEqual(report["phase"], "prepare completed destination")
         self.assertEqual((destination / "cover.jpg").read_bytes(), b"original cover")
+
+    def test_review_report_records_candidate_rejection_and_eac_evidence(self):
+        staged, library = self.pair()
+        (staged.parent / "rip.log").write_text(
+            "Exact Audio Copy\nTOC of the extracted CD\n1 | 0:00.00 | 0:01.00 | 0 | 74\n"
+        )
+        preview = subprocess.run(
+            [sys.executable, "-m", "taggz", "--config", str(self.config), "--offline"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(preview.returncode, 1)
+        self.assertIn("needs-review during match release", preview.stdout)
+        self.assertIn("Candidate rejected:", preview.stdout)
+        self.assertIn("medium does not match", preview.stdout)
+        self.assertIn("Inspecting", preview.stderr)
+        (report,) = self.run_cli("--apply", expected=1)
+        self.assertEqual(report["phase"], "match release")
+        self.assertIn("verified disc 1 TOC", report["input"]["rip_logs"]["rip.log"])
+        self.assertEqual(report["input"]["medium"], "CD")
+        (candidate,) = report["candidates"]
+        self.assertEqual(candidate["source"], f"library: {library.parent.name}")
+        self.assertEqual(candidate["decision"], "rejected")
+        self.assertIn("staging is CD, candidate is Digital Media", candidate["reason"])
+        saved = json.loads(Path(report["report_file"]).read_text())
+        self.assertEqual(saved["candidates"], report["candidates"])
 
     def test_toc_tie_keeps_recordings_but_not_pressing_identity(self):
         staged, _ = self.pair()

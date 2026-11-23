@@ -317,7 +317,6 @@ class Catalog:
             except (URLError, TimeoutError, json.JSONDecodeError, UnicodeError):
                 if attempt:
                     self.errors.add(f"{service} request failed")
-        self._cache[key] = {}
         return {}
 
     @staticmethod

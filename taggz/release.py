@@ -4,7 +4,7 @@ import os
 import re
 import stat
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from mutagen import MutagenError
@@ -128,6 +128,7 @@ class Release:
     tocs: list[Toc]
     files: dict[Path, tuple[int, int, int, int, int]]
     cue_isrcs: dict[tuple[int, int], str]
+    rip_logs: dict[str, str] = field(default_factory=dict)
 
     @property
     def tags(self) -> dict[str, list[str]]:
@@ -256,6 +257,7 @@ def read_release(root: Path) -> Release:
     cue_barcodes = []
     cue_codes: dict[tuple[int, int], set[str]] = {}
     tocs = []
+    rip_logs = {}
     eac = False
     for path in paths:
         if path.suffix.lower() == ".cue":
@@ -281,10 +283,18 @@ def read_release(root: Path) -> Release:
             continue
         log = text_file(root / path)
         if "Exact Audio Copy" not in log:
+            rip_logs[path.as_posix()] = "format is not recognized as Exact Audio Copy"
             continue
         eac = True
         disc = disc_number(path)
         toc = read_toc(log, [t for t in tracks if t.disc == disc])
+        rip_logs[path.as_posix()] = (
+            f"verified disc {disc} TOC ({toc.id})"
+            if toc
+            else (
+                f"Exact Audio Copy log found, but the disc {disc} table of contents could not be verified against the FLACs"
+            )
+        )
         if toc and toc not in tocs:
             tocs.append(toc)
     if len({toc.disc for toc in tocs}) != len(tocs):
@@ -325,4 +335,5 @@ def read_release(root: Path) -> Release:
         tocs,
         entries,
         {key: next(iter(codes)) for key, codes in cue_codes.items() if len(codes) == 1},
+        rip_logs,
     )

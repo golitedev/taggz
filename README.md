@@ -32,7 +32,7 @@ To preview a single album, pass its staging folder name exactly:
 python3 -m taggz.docker --config taggz.toml --json -- "Artist - Album"
 ```
 
-`--json` includes the proposed tag values, matching evidence, and source URLs. Use `--offline` to search the library only. Native execution is also possible with `pip install .` and `taggz --config taggz.toml`. Install FLAC's `metaflac` binary for native ReplayGain. Use the Docker launcher when you want the OS to enforce read-only library access.
+`--json` includes before-and-after tag values, input evidence, and the reason each candidate qualified or was rejected. Apply saves the same details in the release report and prints its path. Review reports identify the step that failed. Use `--offline` to search the library only. Native execution is also possible with `pip install .` and `taggz --config taggz.toml`. Install FLAC's `metaflac` binary for native ReplayGain. Use the Docker launcher when you want the OS to enforce read-only library access.
 
 ## Staging layout
 

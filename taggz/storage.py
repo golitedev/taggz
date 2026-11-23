@@ -194,12 +194,14 @@ class Staging:
         backup_path = self.backups / (identifier + ".zip")
         report_path = self.reports / (identifier + ".json")
         try:
+            report["phase"] = "copy release"
             shutil.copytree(source, candidate, symlinks=True)
             if set(snapshot(candidate)) != set(proposal.release.files):
                 raise Review("file list changed during copying")
             report["audio_sha256"] = self.prepare(
-                candidate, proposal, sidecars, packed, replaygain
+                candidate, proposal, sidecars, packed, replaygain, report
             )
+            report["phase"] = "publish completed release"
             if snapshot(source) != proposal.release.files:
                 raise Review("source changed during preparation")
             if not vacant(destination):
@@ -220,9 +222,10 @@ class Staging:
                 report_file=str(report_path),
             )
             packed.rename(backup_path)
-            atomic_json(report_path, report)
+            atomic_json(report_path, report | {"phase": "completed"})
             source.rename(job / "original")
             candidate.rename(destination)
+            report["phase"] = "completed"
         finally:
             self.recover(job)
         return destination
@@ -234,12 +237,14 @@ class Staging:
         sidecars: list[Sidecar],
         packed: Path,
         replaygain: bool,
+        report: dict,
     ) -> dict[str, str]:
         audio_hashes = {}
         expected_metadata = {}
         extras = {}
         moves = candidate.parent / "moves"
         moves.mkdir()
+        report["phase"] = "back up metadata and write tags"
         with zipfile.ZipFile(packed, "x", compression=zipfile.ZIP_DEFLATED) as backup:
             index = {
                 "source": proposal.release.root.name,
@@ -289,6 +294,7 @@ class Staging:
             )
 
         # Park all renamed files first so swaps and case-only renames are safe.
+        report["phase"] = "rename tracks and sidecars"
         paths = [(item.track.path, item.path) for item in proposal.tracks]
         paths += [(item.old, item.new) for item in sidecars if item.old != item.new]
         for i, (old, _) in enumerate(paths):
@@ -300,6 +306,7 @@ class Staging:
                 raise Review(f"filename collision: {new}")
             (moves / str(i)).rename(target)
         if replaygain:
+            report["phase"] = "calculate ReplayGain"
             result = subprocess.run(
                 [
                     "metaflac",
@@ -320,6 +327,7 @@ class Staging:
             "replaygain_album_peak",
         }
         gain_fields = expected_gain | {"replaygain_reference_loudness"}
+        report["phase"] = "verify audio, tags and sidecars"
         for entry in proposal.tracks:
             path = candidate / entry.path
             tagged = FLAC(path)
@@ -347,4 +355,11 @@ class Staging:
                 raise Review(f"missing ReplayGain tags: {entry.path}")
         if any(digest(candidate / path) != value for path, value in extras.items()):
             raise Review("a sidecar changed unexpectedly")
+        report["verification"] = {
+            "audio_frame_hashes_matched": len(audio_hashes),
+            "track_tags_verified": len(proposal.tracks),
+            "embedded_artwork_preserved": True,
+            "sidecars_verified": len(extras),
+            "replaygain_calculated": replaygain,
+        }
         return audio_hashes
