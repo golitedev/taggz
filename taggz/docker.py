@@ -20,9 +20,10 @@ def main() -> int:
     try:
         config_file = args.config.expanduser().resolve(strict=True)
         config = load_config(config_file)
-        if any(
-            "," in str(path) for path in (config_file, config.staging, config.library)
-        ):
+        credentials = (
+            config.qobuz_credentials if config.qobuz and not args.offline else None
+        )
+        if any("," in str(path) for path in (config_file, config.staging, credentials)):
             raise ValueError("Docker bind paths cannot contain commas")
         command = [
             "docker",
@@ -38,13 +39,26 @@ def main() -> int:
             "--mount",
             f"type=bind,src={config_file},dst=/config.toml,readonly",
             "--mount",
-            f"type=bind,src={config.library},dst=/library,readonly,bind-propagation=rprivate,bind-recursive=readonly",
-            "--mount",
             f"type=bind,src={config.staging},dst=/staging,bind-propagation=rprivate,bind-recursive=disabled"
             + ("" if args.apply else ",readonly"),
         ]
         if args.offline:
             command.extend(["--network", "none"])
+        if credentials is not None:
+            if not credentials.is_file():
+                raise ValueError(
+                    "Qobuz credentials file does not exist or is not a file"
+                )
+            command.extend(
+                [
+                    "--mount",
+                    f"type=bind,src={credentials},dst=/qobuz-credentials,readonly",
+                ]
+            )
+        if config.qobuz and not args.offline:
+            for name in ("TAGGZ_QOBUZ_TOKEN", "TAGGZ_QOBUZ_APP_ID"):
+                if name in os.environ:
+                    command.extend(["--env", name])
         if (
             config.discogs
             and not args.offline

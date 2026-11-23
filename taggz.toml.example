@@ -1,6 +1,5 @@
 [paths]
-staging = "/mnt/disk4/media/music-tag-staging"
-library = "/mnt/disk4/media/music-main"
+staging = "/mnt/disk4/taggz"
 
 [matching]
 musicbrainz = true
@@ -10,6 +9,12 @@ discogs = true
 discogs_token_env = "TAGGZ_DISCOGS_TOKEN"
 # Use a contact address or URL to identify your MusicBrainz requests.
 contact = ""
+
+[qobuz]
+enabled = true
+# Use a separate credentials file or set TAGGZ_QOBUZ_TOKEN before running.
+# credentials_file = "/srv/docker/taggz/qobuz-credentials.toml"
+# app_id = "123456789"
 
 [output]
 replaygain = true

@@ -1,4 +1,3 @@
-import os
 import re
 import tomllib
 from dataclasses import dataclass
@@ -8,12 +7,14 @@ from pathlib import Path
 @dataclass(frozen=True)
 class Config:
     staging: Path
-    library: Path
     musicbrainz: bool = True
     discogs: bool = True
     discogs_token_env: str = "TAGGZ_DISCOGS_TOKEN"
     contact: str = ""
     replaygain: bool = True
+    qobuz: bool = True
+    qobuz_credentials: Path | None = None
+    qobuz_app_id: str = ""
 
 
 def load_config(path: Path, *, container: bool = False) -> Config:
@@ -21,23 +22,13 @@ def load_config(path: Path, *, container: bool = False) -> Config:
         raw = tomllib.load(stream)
     paths = raw["paths"]
     staging = Path(paths["staging"]).expanduser()
-    library = Path(paths["library"]).expanduser()
-    if not staging.is_absolute() or not library.is_absolute():
-        raise ValueError("paths.staging and paths.library must be absolute")
+    if not staging.is_absolute():
+        raise ValueError("paths.staging must be absolute")
     if container:
-        staging, library = Path("/staging"), Path("/library")
-        if not os.statvfs(library).f_flag & os.ST_RDONLY:
-            raise ValueError("mount /library read-only")
+        staging = Path("/staging")
     staging = staging.resolve(strict=True)
-    library = library.resolve(strict=True)
-    if not staging.is_dir() or not library.is_dir():
-        raise ValueError("staging and library must be existing directories")
-    if staging == library or staging in library.parents or library in staging.parents:
-        raise ValueError(
-            "staging and library must be separate, non-overlapping directories"
-        )
-    if staging.samefile(library):
-        raise ValueError("staging and library point to the same directory")
+    if not staging.is_dir():
+        raise ValueError("staging must be an existing directory")
     matching = raw.get("matching", {})
     output = raw.get("output", {})
     token_env = matching.get("discogs_token_env", "TAGGZ_DISCOGS_TOKEN")
@@ -48,13 +39,36 @@ def load_config(path: Path, *, container: bool = False) -> Config:
     contact = matching.get("contact", "")
     if not isinstance(contact, str) or "\n" in contact or "\r" in contact:
         raise ValueError("matching.contact must be a single-line string")
-    options = (
-        matching.get("musicbrainz", True),
-        matching.get("discogs", True),
-        output.get("replaygain", True),
+    qobuz = raw.get("qobuz", {})
+    credentials = qobuz.get("credentials_file", "")
+    if not isinstance(credentials, str):
+        raise ValueError("qobuz.credentials_file must be an absolute path")
+    credentials_path = Path(credentials).expanduser() if credentials else None
+    if credentials_path is not None:
+        if not credentials_path.is_absolute():
+            raise ValueError("qobuz.credentials_file must be an absolute path")
+        if container:
+            credentials_path = Path("/qobuz-credentials")
+    app_id = qobuz.get("app_id", "")
+    if not isinstance(app_id, str) or (
+        app_id and not re.fullmatch(r"[0-9]{9}", app_id)
+    ):
+        raise ValueError("qobuz.app_id must be a quoted nine-digit app ID")
+    options = dict(
+        musicbrainz=matching.get("musicbrainz", True),
+        discogs=matching.get("discogs", True),
+        replaygain=output.get("replaygain", True),
+        qobuz=qobuz.get("enabled", True),
     )
-    if any(type(option) is not bool for option in options):
-        raise ValueError("musicbrainz, discogs, and replaygain must be booleans")
+    if any(type(option) is not bool for option in options.values()):
+        raise ValueError(
+            "musicbrainz, discogs, replaygain and qobuz.enabled must be booleans"
+        )
     return Config(
-        staging, library, options[0], options[1], token_env, contact, options[2]
+        staging,
+        discogs_token_env=token_env,
+        contact=contact,
+        qobuz_credentials=credentials_path,
+        qobuz_app_id=app_id,
+        **options,
     )

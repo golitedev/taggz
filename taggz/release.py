@@ -122,7 +122,6 @@ class Track:
     seconds: float
     bits: int
     rate: int
-    pcm_md5: int
     tags: dict[str, list[str]]
     channels: int = 2
 
@@ -212,7 +211,6 @@ def read_track(root: Path, path: Path) -> Track:
         audio.info.length,
         audio.info.bits_per_sample,
         audio.info.sample_rate,
-        audio.info.md5_signature,
         tags,
         channels=audio.info.channels,
     )

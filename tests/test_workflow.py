@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import shutil
@@ -7,6 +8,7 @@ import tempfile
 import unittest
 import wave
 import zipfile
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -14,8 +16,9 @@ from unittest.mock import patch
 from mutagen.flac import FLAC
 
 from taggz.catalog import Catalog, Edition, Entry, from_discogs, from_musicbrainz
+from taggz.cli import main as cli_main
 from taggz.config import load_config
-from taggz.match import Library, common, propose, score, select
+from taggz.match import common, propose, score, select
 from taggz.release import Review, read_release, read_toc
 from taggz.storage import Staging, atomic_json, read_header, replaygain_skip_reason
 
@@ -29,12 +32,12 @@ class Workflow(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
         self.staging = self.root / "staging"
-        self.library = self.root / "library"
+        self.reference = self.root / "reference"
         self.staging.mkdir()
-        self.library.mkdir()
+        self.reference.mkdir()
         self.config = self.root / "settings.toml"
         self.config.write_text(
-            f'[paths]\nstaging = "{self.staging}"\nlibrary = "{self.library}"\n',
+            f'[paths]\nstaging = "{self.staging}"\n',
             encoding="utf-8",
         )
         self.flac = self.make_flac(44100)
@@ -71,7 +74,7 @@ class Workflow(unittest.TestCase):
             date="2024-03-15",
         )
         library = self.track(
-            self.library / "Artist — Album (2024) [WEB] [FLAC] [16B-44.1kHz]",
+            self.reference / "provider-fixture",
             "01 - Song.flac",
             **tags,
             composer="A Writer",
@@ -80,34 +83,54 @@ class Workflow(unittest.TestCase):
         staged = self.track(self.staging / "Artist - Album", **tags)
         return staged, library
 
-    def run_cli(self, *options, expected=0):
-        container = bool(os.environ.get("TAGGZ_TEST_DOCKER"))
-        module = "taggz.docker" if container else "taggz"
-        proc = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                module,
-                "--config",
-                str(self.config),
-                "--offline",
-                "--json",
-                *options,
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(proc.returncode, expected, proc.stdout + proc.stderr)
-        releases = json.loads(proc.stdout)["releases"]
-        if container:
-            for release in releases:
-                for key in ("destination", "backup", "report_file"):
-                    if key in release:
-                        release[key] = str(
-                            self.staging / Path(release[key]).relative_to("/staging")
-                        )
-        return releases
+    def fixture_edition(self, release):
+        path = self.reference / "provider-fixture"
+        if not path.is_dir() or release.title != "Album":
+            return []
+        stored = read_release(path)
+        return [
+            Edition(
+                stored.artist,
+                stored.title,
+                stored.date,
+                stored.medium,
+                [
+                    Entry(
+                        track.disc,
+                        track.number,
+                        track.title,
+                        track.seconds,
+                        {
+                            key: track.tags[key]
+                            for key in ("artist", "artists", "isrc", "composer")
+                            if key in track.tags
+                        },
+                    )
+                    for track in stored.tracks
+                ],
+                "https://open.qobuz.com/album/album-identity",
+                {"barcode": [stored.barcode], "qobuz_album_id": ["album-identity"]},
+            )
+        ]
+
+    def run_cli(self, *options, expected=0, raw=False):
+        args = ["taggz", "--config", str(self.config)]
+        if not raw:
+            args.append("--json")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with (
+            patch.object(sys, "argv", args + list(options)),
+            patch("taggz.catalog.Catalog.qobuz", side_effect=self.fixture_edition),
+            patch("taggz.catalog.Catalog.musicbrainz", return_value=[]),
+            patch("taggz.catalog.Catalog.discogs", return_value=[]),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            status = cli_main()
+        self.assertEqual(status, expected, stdout.getvalue() + stderr.getvalue())
+        if raw:
+            return stdout.getvalue(), stderr.getvalue()
+        return json.loads(stdout.getvalue())["releases"]
 
     def test_preview_is_read_only_and_apply_preserves_audio(self):
         staged, library = self.pair()
@@ -144,7 +167,7 @@ class Workflow(unittest.TestCase):
         completed = Path(reports[0]["destination"])
         new = completed / "01 - Song.flac"
         audio = FLAC(new)
-        self.assertEqual(reports[0]["same_library_edition"], [library.parent.name])
+        self.assertEqual(reports[0]["match_scope"], "release edition")
         self.assertEqual(audio["composer"], ["A Writer"])
         self.assertEqual(audio["qobuz_album_id"], ["album-identity"])
         self.assertEqual(audio["tracknumber"], ["01"])
@@ -180,7 +203,7 @@ class Workflow(unittest.TestCase):
         self.assertTrue((Path(report["destination"]) / "linked.flac").is_symlink())
         self.assertEqual(library.read_bytes(), original)
 
-    def test_hardlinked_track_is_not_modified_in_library(self):
+    def test_hardlinked_track_is_not_modified_outside_staging(self):
         staged, library = self.pair()
         staged.unlink()
         os.link(library, staged)
@@ -208,22 +231,19 @@ class Workflow(unittest.TestCase):
         (staged.parent / "rip.log").write_text(
             "Exact Audio Copy\nTOC of the extracted CD\n1 | 0:00.00 | 0:01.00 | 0 | 74\n"
         )
-        preview = subprocess.run(
-            [sys.executable, "-m", "taggz", "--config", str(self.config), "--offline"],
-            capture_output=True,
-            text=True,
-        )
-        self.assertEqual(preview.returncode, 1)
-        self.assertIn("needs-review during match release", preview.stdout)
-        self.assertIn("Candidate rejected:", preview.stdout)
-        self.assertIn("medium does not match", preview.stdout)
-        self.assertIn("Inspecting", preview.stderr)
+        stdout, stderr = self.run_cli(expected=1, raw=True)
+        self.assertIn("needs-review during match release", stdout)
+        self.assertIn("Candidate rejected:", stdout)
+        self.assertIn("medium does not match", stdout)
+        self.assertIn("Inspecting", stderr)
         (report,) = self.run_cli("--apply", expected=1)
         self.assertEqual(report["phase"], "match release")
         self.assertIn("verified disc 1 TOC", report["input"]["rip_logs"]["rip.log"])
         self.assertEqual(report["input"]["medium"], "CD")
         (candidate,) = report["candidates"]
-        self.assertEqual(candidate["source"], f"library: {library.parent.name}")
+        self.assertEqual(
+            candidate["source"], "https://open.qobuz.com/album/album-identity"
+        )
         self.assertEqual(candidate["decision"], "rejected")
         self.assertIn("staging is CD, candidate is Digital Media", candidate["reason"])
         saved = json.loads(Path(report["report_file"]).read_text())
@@ -486,7 +506,6 @@ class Workflow(unittest.TestCase):
         self.assertEqual(report["tracks"][0]["fields"]["composer"], ["A Writer"])
         self.assertEqual(report["withheld_release_fields"], ["qobuz_album_id"])
         candidate = report["candidates"][0]
-        self.assertEqual(candidate["matching_pcm_checksums"], 5)
         self.assertEqual(candidate["matching_isrcs"], 5)
         self.assertIn("barcode differs", candidate["edition_reason"])
 
@@ -522,7 +541,7 @@ class Workflow(unittest.TestCase):
             {"qobuz_album_id": ["other"], "barcode": ["602465081497"]},
         )
         with patch.object(catalog, "musicbrainz", return_value=[other]):
-            proposal = propose(release, Library(self.library), catalog, {})
+            proposal = propose(release, catalog, {})
         self.assertIn("CD rip tables", proposal.evidence)
         self.assertIn("(2024) [CD]", proposal.folder)
         self.assertEqual(proposal.tracks[0].tags["media"], ["CD"])
@@ -552,7 +571,7 @@ class Workflow(unittest.TestCase):
             tracks=[Entry(1, 1, "Song (Mix Version)", 1.1)],
         )
         with patch.object(catalog, "musicbrainz", return_value=[generic, version]):
-            proposal = propose(release, Library(self.library), catalog, {})
+            proposal = propose(release, catalog, {})
         self.assertEqual(proposal.sources, ["explicit"])
         self.assertIn("Album (Mix Version)", proposal.folder)
 
@@ -625,7 +644,7 @@ class Workflow(unittest.TestCase):
             patch.object(catalog, "musicbrainz", return_value=[preferred]),
             patch.object(catalog, "discogs", return_value=[linked]) as fetch,
         ):
-            proposal = propose(release, Library(self.library), catalog, diagnostics)
+            proposal = propose(release, catalog, diagnostics)
         self.assertEqual(fetch.call_args.args[1], [linked.source])
         self.assertEqual(proposal.tracks[0].tags["mastering"], ["A Mastering Engineer"])
         self.assertEqual(diagnostics["candidates"][-1]["decision"], "supplemental")
@@ -687,38 +706,42 @@ class Workflow(unittest.TestCase):
 
 
 class Configuration(unittest.TestCase):
-    def test_rejects_overlapping_roots(self):
+    def test_config_ignores_removed_path(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            library = root / "library"
-            library.mkdir()
             config = root / "settings.toml"
-            config.write_text(f'[paths]\nstaging = "{root}"\nlibrary = "{library}"\n')
-            with self.assertRaisesRegex(ValueError, "non-overlapping"):
-                load_config(config)
+            config.write_text(
+                f'[paths]\nstaging = "{root}"\nlibrary = "{root / "missing"}"\n'
+            )
+            self.assertEqual(load_config(config).staging, root)
 
-    def test_docker_mounts_library_read_only_in_apply(self):
+    def test_docker_mounts_staging_and_qobuz_credentials_only(self):
         from taggz.docker import main
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "library").mkdir()
-            (root / "staging").mkdir()
+            staging = root / "staging"
+            staging.mkdir()
+            credentials = root / "qobuz.txt"
+            credentials.touch()
             config = root / "settings.toml"
             config.write_text(
-                f'[paths]\nstaging = "{root / "staging"}"\nlibrary = "{root / "library"}"\n'
+                f'[paths]\nstaging = "{staging}"\nlibrary = "{root / "missing"}"\n'
+                f'[qobuz]\ncredentials_file = "{credentials}"\n'
             )
-            with patch.object(
-                sys, "argv", ["taggz-docker", "--config", str(config), "--apply"]
+            with (
+                patch.object(
+                    sys, "argv", ["taggz-docker", "--config", str(config), "--apply"]
+                ),
+                patch("taggz.docker.subprocess.call", return_value=0) as call,
             ):
-                with patch("taggz.docker.subprocess.call", return_value=0) as call:
-                    self.assertEqual(main(), 0)
+                self.assertEqual(main(), 0)
             (command,) = call.call_args.args
+            self.assertFalse(any("dst=/library" in arg for arg in command))
             self.assertIn(
-                f"type=bind,src={root / 'library'},dst=/library,readonly,bind-propagation=rprivate,bind-recursive=readonly",
-                command,
+                f"type=bind,src={credentials},dst=/qobuz-credentials,readonly", command
             )
             self.assertIn(
-                f"type=bind,src={root / 'staging'},dst=/staging,bind-propagation=rprivate,bind-recursive=disabled",
+                f"type=bind,src={staging},dst=/staging,bind-propagation=rprivate,bind-recursive=disabled",
                 command,
             )

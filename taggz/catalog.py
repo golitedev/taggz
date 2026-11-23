@@ -4,11 +4,14 @@ import re
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import date
+from html.parser import HTMLParser
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from .config import Config
+from .qobuz import ALBUM_ID, Qobuz
 from .release import Release, first, normalize
 
 
@@ -19,7 +22,6 @@ class Entry:
     title: str
     seconds: float | None
     tags: dict[str, list[str]] = field(default_factory=dict)
-    pcm: tuple[int, int, int, int] | None = None
 
 
 @dataclass
@@ -44,6 +46,251 @@ def fields(**values) -> dict[str, list[str]]:
         for key, value in values.items()
         if value
     }
+
+
+class Description(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+
+    def handle_data(self, data):
+        self.parts.append(data)
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {"br", "p", "div", "li"}:
+            self.parts.append("\n")
+
+
+QOBUZ_CREDIT_ROLES = {
+    "composer": ("composer",),
+    "composerlyricist": ("composer", "lyricist"),
+    "lyricist": ("lyricist",),
+    "writer": ("writer",),
+    "songwriter": ("writer",),
+    "author": ("writer",),
+    "producer": ("producer",),
+    "coproducer": ("producer",),
+    "arranger": ("arranger",),
+    "orchestrator": ("arranger",),
+    "conductor": ("conductor",),
+    "mixer": ("mixer",),
+    "mixingengineer": ("mixer",),
+    "mixengineer": ("mixer",),
+    "engineer": ("engineer",),
+    "recordingengineer": ("engineer",),
+    "masteringengineer": ("mastering", "engineer"),
+    "masterer": ("mastering", "engineer"),
+    "remasteringengineer": ("mastering", "engineer"),
+    "remixer": ("remixer",),
+    "director": ("director",),
+    "musicdirector": ("director",),
+    "musicpublisher": ("publisher",),
+}
+QOBUZ_INSTRUMENT = re.compile(
+    r"performer|vocal|guitar|bass|drum|percussion|piano|keyboard|synth|saxophone|"
+    r"trumpet|trombone|flute|clarinet|violin|viola|cello|organ|strings|harp|"
+    r"accordion|orchestra|ensemble|choir|soloist|voice|instrument|horn|programming|\brap(?:per)?\b",
+    re.I,
+)
+
+
+def qobuz_name(value) -> str:
+    name = value.get("name") if isinstance(value, dict) else value
+    return name.strip() if isinstance(name, str) else ""
+
+
+def qobuz_version(title: str, version: str) -> str:
+    already_present = version and (
+        normalize(title).endswith(normalize(version))
+        or any(
+            normalize(part).startswith(normalize(version))
+            for part in re.findall(r"\(([^()]*)\)", title)
+        )
+    )
+    if version and not already_present:
+        return f"{title} ({version})"
+    return title
+
+
+def qobuz_date(value) -> str:
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value).isoformat()
+        except ValueError:
+            pass
+    return ""
+
+
+def qobuz_artists(items: list[dict]) -> tuple[list[str], list[str]]:
+    main, featured = [], []
+    for item in items:
+        name = qobuz_name(item)
+        roles = {normalize(role) for role in item.get("roles") or []}
+        if name and "featuredartist" in roles:
+            featured.append(name)
+        elif name and (not roles or "mainartist" in roles):
+            main.append(name)
+    return main, featured
+
+
+def qobuz_display(main: list[str], featured: list[str]) -> str:
+    if not main:
+        return ", ".join(featured)
+    primary = ", ".join(main)
+    return f"{primary} feat. {', '.join(featured)}" if featured else primary
+
+
+def qobuz_credits(
+    text: str,
+    primary: str,
+) -> tuple[dict[str, list[str]], list[str], list[str]]:
+    credits = defaultdict(list)
+    main, featured = [], []
+    for segment in re.split(r"\s+-\s+", text):
+        parts = [item.strip() for item in segment.strip().split(",")]
+        # A name can contain commas. Split at the first recognizable role.
+        for i, part in enumerate(parts[1:], 1):
+            key = normalize(part)
+            if (
+                key in QOBUZ_CREDIT_ROLES
+                or key in {"mainartist", "featuredartist"}
+                or QOBUZ_INSTRUMENT.search(part)
+                or "engineer" in key
+            ):
+                break
+        else:
+            continue
+        name = ", ".join(parts[:i]).strip()
+        if not name:
+            continue
+        roles = parts[i:]
+        keys = {normalize(role) for role in roles}
+        if "featuredartist" in keys:
+            featured.append(name)
+        elif "mainartist" in keys and (
+            normalize(name) == normalize(primary)
+            or any(
+                QOBUZ_INSTRUMENT.search(role)
+                and normalize(role) not in {"performer", "associatedperformer"}
+                for role in roles
+            )
+            or not keys & QOBUZ_CREDIT_ROLES.keys()
+        ):
+            main.append(name)
+        for role in roles:
+            key = normalize(role)
+            tags = QOBUZ_CREDIT_ROLES.get(key, ())
+            if not tags and ("engineer" in key or "engineering" in key):
+                tags = ("engineer",)
+            for tag in tags:
+                credits[tag].append(name)
+            if (
+                not tags
+                and key != "associatedperformer"
+                and QOBUZ_INSTRUMENT.search(role)
+            ):
+                credits["performer"].append(f"{name} ({role})")
+    return fields(**credits), main, featured
+
+
+def from_qobuz(data: dict) -> Edition:
+    album_id = str(data["id"])
+    if not ALBUM_ID.fullmatch(album_id):
+        raise ValueError("invalid album ID")
+    main, featured = qobuz_artists(data.get("artists") or [])
+    primary = qobuz_name(data.get("artist"))
+    main = main or ([primary] if primary else [])
+    artist = qobuz_display(main, featured)
+    original = qobuz_date(data.get("release_date_original"))
+    released = next(
+        (
+            value
+            for key in ("release_date_download", "release_date_stream", "release_date")
+            if (value := qobuz_date(data.get(key)))
+        ),
+        original,
+    )
+    description = Description()
+    description.feed(data.get("description") or "")
+    album_tags = fields(
+        albumartists=[*main, *featured],
+        albumcomposer=qobuz_name(data.get("composer")),
+        barcode=str(data.get("upc") or ""),
+        copyright=qobuz_name(data.get("copyright")),
+        description="\n".join(
+            line.strip()
+            for line in "".join(description.parts).splitlines()
+            if line.strip()
+        ),
+        genre=qobuz_name(data.get("genre")),
+        label=qobuz_name(data.get("label")),
+        originaldate=original,
+        compilation="1" if data.get("release_type") == "compilation" else "",
+        releasetype=data.get("release_type"),
+        qobuz_album_id=album_id,
+    )
+    version = qobuz_name(data.get("version"))
+    entries = []
+    for item in data["tracks"]["items"]:
+        track_primary = qobuz_name(item.get("performer"))
+        direct_main, direct_featured = qobuz_artists(item.get("artists") or [])
+        credits, parsed_main, parsed_featured = qobuz_credits(
+            item.get("performers") or "", track_primary
+        )
+        featured_names = list(dict.fromkeys([*direct_featured, *parsed_featured]))
+        main_names = (
+            direct_main or parsed_main or ([track_primary] if track_primary else [])
+        )
+        main_names = [
+            name
+            for name in main_names
+            if normalize(name) not in {normalize(f) for f in featured_names}
+        ]
+        track_artist = qobuz_display(main_names, featured_names)
+        composer = qobuz_name(item.get("composer"))
+        if composer:
+            credits.setdefault("composer", [composer])
+        warning = item.get("parental_warning")
+        work = qobuz_name(item.get("work"))
+        title = qobuz_version(item["title"].strip(), qobuz_name(item.get("version")))
+        if work and normalize(work) not in normalize(title):
+            title = f"{work}: {title}"
+        tags = (
+            fields(
+                artist=track_artist,
+                artists=[*main_names, *featured_names],
+                copyright=qobuz_name(item.get("copyright")),
+                isrc=qobuz_name(item.get("isrc")).upper(),
+                itunesadvisory="1"
+                if warning is True
+                else "0"
+                if warning is False
+                else "",
+                qobuz_track_id=str(item["id"]),
+                work=work,
+            )
+            | credits
+        )
+        entries.append(
+            Entry(
+                int(item["media_number"]),
+                int(item["track_number"]),
+                title,
+                item.get("duration") or None,
+                tags,
+            )
+        )
+    entries.sort(key=lambda item: (item.disc, item.number))
+    return Edition(
+        artist,
+        qobuz_version(data["title"].strip(), version),
+        released,
+        "Digital Media",
+        entries,
+        f"https://open.qobuz.com/album/{album_id}",
+        album_tags,
+        variant=version,
+    )
 
 
 def medium_name(value: str) -> str:
@@ -300,9 +547,24 @@ class Catalog:
         self.config = config
         self.offline = offline
         self.errors: set[str] = set()
+        self.qobuz_client = Qobuz(config, self.errors, offline=offline)
         self._cache: dict[tuple, dict] = {}
         self._next: dict[str, float] = {}
         self._agent = "Taggz/0.1.0" + (f" ({config.contact})" if config.contact else "")
+
+    def qobuz(self, release: Release) -> list[Edition]:
+        editions = []
+        try:
+            albums = self.qobuz_client.albums(release)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            self.errors.add("Qobuz returned invalid search or album metadata")
+            return []
+        for album in albums:
+            try:
+                editions.append(from_qobuz(album))
+            except (AttributeError, KeyError, OverflowError, TypeError, ValueError):
+                self.errors.add("Qobuz returned incomplete or invalid album metadata")
+        return editions
 
     def get(self, service: str, endpoint: str, **params) -> dict:
         key = (service, endpoint, tuple(sorted(params.items())))

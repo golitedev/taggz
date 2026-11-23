@@ -12,7 +12,7 @@ from mutagen import MutagenError
 
 from .catalog import Catalog
 from .config import load_config
-from .match import Library, propose
+from .match import propose
 from .release import Release, Review, read_release
 from .sidecars import plan_sidecars
 from .storage import RESERVED, Staging, replaygain_skip_reason, staging_lock, vacant
@@ -69,6 +69,8 @@ def input_evidence(release: Release) -> dict:
 
 def run(args) -> tuple[list[dict], int]:
     cfg = load_config(args.config, container=args.container)
+    if args.apply and args.offline:
+        raise ValueError("--apply requires online catalog lookups")
     if args.apply and cfg.replaygain and not shutil.which("metaflac"):
         raise ValueError("metaflac is required when ReplayGain is enabled")
     catalog = Catalog(cfg, offline=args.offline)
@@ -81,6 +83,13 @@ def run(args) -> tuple[list[dict], int]:
     providers = {
         name: "offline" if args.offline else mode if enabled else "disabled"
         for name, enabled, mode in (
+            (
+                "Qobuz",
+                cfg.qobuz,
+                "album metadata lookup"
+                if catalog.qobuz_client.configured
+                else "credentials not configured",
+            ),
             ("MusicBrainz", cfg.musicbrainz, "release and CD disc ID lookup"),
             ("Discogs", cfg.discogs, discogs_mode),
         )
@@ -90,7 +99,6 @@ def run(args) -> tuple[list[dict], int]:
     with staging_lock(cfg.staging) if args.apply else nullcontext():
         if args.apply:
             state.setup()
-        library = Library(cfg.library)
         paths = release_paths(cfg.staging, args.releases)
         for number, path in enumerate(paths, 1):
             catalog.errors.clear()
@@ -106,14 +114,15 @@ def run(args) -> tuple[list[dict], int]:
                 "started_at": datetime.now(UTC).isoformat(timespec="seconds"),
                 "candidates": [],
                 "sources": [],
-                "library_matches": [],
                 "providers": providers,
             }
             try:
                 release = read_release(path)
                 report["input"] = input_evidence(release)
                 report["phase"] = "match release"
-                proposal = propose(release, library, catalog, report)
+                if args.offline:
+                    raise Review("online catalog lookups disabled")
+                proposal = propose(release, catalog, report)
                 report.update(proposal.report())
                 report["phase"] = "plan sidecars"
                 sidecars = plan_sidecars(proposal)
@@ -253,18 +262,10 @@ def render(reports: list[dict], apply: bool) -> None:
                     f"(largest difference {candidate['maximum_duration_difference_seconds']:.3f}s)"
                 )
                 facts.append(f"{candidate['matching_isrcs']} matching ISRCs")
-            if candidate["matching_pcm_checksums"]:
-                facts.append(
-                    f"{candidate['matching_pcm_checksums']} identical PCM checksums"
-                )
             if facts:
                 print("    " + ", ".join(facts))
         if held := row.get("withheld_release_fields"):
             print(f"  Unverified edition tags left unset: {', '.join(held)}")
-        for name in row["library_matches"]:
-            print(f"  Library: {name}")
-        for name in row.get("unreadable_library_matches", []):
-            print(f"  Could not read the library release for comparison: {name}")
         print(
             "  Lookups: "
             + ", ".join(f"{name} ({mode})" for name, mode in row["providers"].items())
@@ -302,7 +303,9 @@ def main() -> int:
         "--apply", action="store_true", help="apply changes and route releases"
     )
     parser.add_argument(
-        "--offline", action="store_true", help="compare with the read-only library only"
+        "--offline",
+        action="store_true",
+        help="inspect local files without catalog lookups",
     )
     parser.add_argument(
         "--json",
