@@ -1,0 +1,15 @@
+[paths]
+staging = "/mnt/disk4/media/music-tag-staging"
+library = "/mnt/disk4/media/music-main"
+
+[matching]
+musicbrainz = true
+discogs = true
+# A Discogs token enables catalog/barcode search. Public linked releases
+# can be read without a token.
+discogs_token_env = "TAGGZ_DISCOGS_TOKEN"
+# Use a contact address or URL to identify your MusicBrainz requests.
+contact = ""
+
+[output]
+replaygain = true
