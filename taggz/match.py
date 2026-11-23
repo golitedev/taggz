@@ -10,6 +10,7 @@ from .release import (
     Release,
     Review,
     Track,
+    artist_credit,
     barcode_key,
     first,
     folder_identity,
@@ -25,6 +26,7 @@ CREDITS = {
     "producer",
     "mixartist",
     "mixer",
+    "mastering",
     "engineer",
     "arranger",
     "conductor",
@@ -258,7 +260,10 @@ def album_identity_matches(
 
 
 def same_pcm(track: Track, entry: Entry) -> bool:
-    return bool(track.pcm_md5 and entry.pcm == (track.pcm_md5, track.bits, track.rate))
+    return bool(
+        track.pcm_md5
+        and entry.pcm == (track.pcm_md5, track.bits, track.rate, track.channels)
+    )
 
 
 def score(
@@ -316,7 +321,7 @@ def score(
     have_durations = len(durations) == len(release.tracks)
     isrc_votes = 0
     for track, entry in zip(release.tracks, edition.tracks):
-        if track.isrc and track.isrc in entry.tags.get("isrc", []):
+        if release.isrc_for(track) in entry.tags.get("isrc", []):
             isrc_votes += 1
 
     if toc and delta <= 3:
@@ -488,8 +493,9 @@ def from_library(release: Release) -> Edition:
                     "musicbrainz_releasetrackid",
                     "qobuz_track_id",
                 }
-            },
-            pcm=(t.pcm_md5, t.bits, t.rate) if t.pcm_md5 else None,
+            }
+            | fields(isrc=release.isrc_for(t)),
+            pcm=(t.pcm_md5, t.bits, t.rate, t.channels) if t.pcm_md5 else None,
         )
         for t in release.tracks
     ]
@@ -514,7 +520,7 @@ def program_match(release: Release, edition: Edition) -> Match | None:
         return None
     pairs = list(zip(release.tracks, edition.tracks, strict=True))
     exact_audio = all(same_pcm(t, e) for t, e in pairs)
-    shared_codes = [bool(t.isrc and t.isrc in e.tags.get("isrc", [])) for t, e in pairs]
+    shared_codes = [release.isrc_for(t) in e.tags.get("isrc", []) for t, e in pairs]
     delta = max(
         (abs(t.seconds - e.seconds) for t, e in pairs if e.seconds is not None),
         default=0,
@@ -716,7 +722,7 @@ def propose(
                 if deltas
                 else None,
                 "matching_isrcs": sum(
-                    bool(t.isrc and t.isrc in e.tags.get("isrc", []))
+                    bool(release.isrc_for(t) in e.tags.get("isrc", []))
                     for t, e in aligned
                 ),
                 "matching_pcm_checksums": sum(same_pcm(t, e) for t, e in aligned),
@@ -808,11 +814,23 @@ def propose(
     sources = [m.source for m in editions]
     supplemental = next(
         (
-            m.edition
-            for m in discogs_matches
+            edition
+            for edition in discogs
             if len(editions) == 1
-            and m.edition.source == preferred.lookup
-            and m.edition.medium == preferred.medium
+            and edition.source == preferred.lookup
+            and edition.medium == preferred.medium
+            and album_identity_matches(release, edition, anchored=True)
+            and title_matches(release.title, edition.title)
+            and layout_issue(release, edition, anchored=True) is None
+            and all(
+                e.seconds is None or abs(t.seconds - e.seconds) <= 4
+                for t, e in zip(release.tracks, edition.tracks, strict=True)
+            )
+            and not (
+                release.barcode
+                and edition.tags.get("barcode")
+                and not barcode_matches(release, edition)
+            )
         ),
         None,
     )
@@ -833,6 +851,10 @@ def propose(
             if program_only:
                 item["edition_reason"] = item["reason"]
                 item["reason"] = evidence
+            elif item["decision"] == "supplemental":
+                item["reason"] = (
+                    "linked by the selected catalog release and matching track order"
+                )
     diagnostics["withheld_release_fields"] = sorted(
         (EDITION_IDS | {"releasecountry"})
         & (
@@ -875,27 +897,20 @@ def propose(
                 title = cd_title(title)
         track_sources = sources[:]
         if supplemental:
-            for key in CREDITS:
+            for key in CREDITS | {"vinylposition"}:
                 if key in supplemental.tracks[idx].tags:
                     verified.setdefault(key, supplemental.tracks[idx].tags[key])
-        if len(verified.get("isrc", [])) > 1:
-            candidate_code = track.isrc or release.cue_isrcs.get(
-                (track.disc, track.number)
-            )
-            if candidate_code not in verified["isrc"]:
-                verified.pop("isrc")
-            else:
-                verified["isrc"] = [candidate_code]
-        # Never overwrite a source ISRC with a code from another mastering.
-        if track.isrc:
-            verified["isrc"] = [track.isrc]
+        if source_isrc := release.isrc_for(track):
+            verified["isrc"] = [source_isrc]
+        elif len(verified.get("isrc", [])) > 1:
+            verified.pop("isrc")
         code = first(verified, "isrc")
         for ref in references:
             choices = [
                 t
                 for t in ref.tracks
                 if code
-                and t.isrc == code
+                and ref.isrc_for(t) == code
                 and track_key(t.title) == track_key(title)
                 and abs(t.seconds - track.seconds) <= 2
             ]
@@ -919,12 +934,17 @@ def propose(
                 continue
             entry_tags[key] = value
         track_artist = (
-            first(verified, "artist") or first(track.tags, "artist") or artist
+            artist_credit(verified, "artist", "artists")
+            or artist_credit(track.tags, "artist", "artists")
+            or artist
         )
         if normalize(track_artist) == normalize(preferred.artist):
             track_artist = artist
         track_artists = (
-            verified.get("artists") or track.tags.get("artists") or [track_artist]
+            verified.get("artists")
+            or track.tags.get("artists")
+            or (track.tags.get("artist") if not verified.get("artist") else None)
+            or [track_artist]
         )
         track_artists = [
             artist if normalize(p) == normalize(preferred.artist) else p
@@ -933,6 +953,11 @@ def propose(
         album_artists = (
             album_tags.get("albumartists")
             or release.tags.get("albumartists")
+            or (
+                release.tags.get("albumartist")
+                if len(release.tags.get("albumartist", [])) > 1
+                else None
+            )
             or [artist]
         )
         album_artists = [

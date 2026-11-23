@@ -38,6 +38,10 @@ TRACK = re.compile(r"^0*(\d{1,3})(?=[ ._-])")
 FEATURE = re.compile(r"\s*[\[(](?:feat(?:uring)?\.?|ft\.?)\s+[^)\]]+[)\]]", re.I)
 FORMAT = re.compile(r"\s*\(\d{4}\)(?:\s*\[[^]]+\])*\s*(?:- INCOMPLETE)?$")
 CUE_ISRC = re.compile(r"^[A-Z]{2}[A-Z0-9]{3}[0-9]{7}$")
+CUE_FILE = re.compile(r'^(\s*FILE\s+)"([^"]+)"\s+\S+\s*$', re.I)
+CUE_TRACK = re.compile(r"^\s*TRACK\s+(\d+)\s+AUDIO\s*$", re.I)
+CUE_INDEX = re.compile(r"^\s*INDEX\s+01\s+\d+:\d+:\d+\s*$", re.I)
+AUDIO_REF = re.compile(r"\.(?:wav|flac|aif|aiff|ape|wv|mp3)$", re.I)
 TOC_ROW = re.compile(
     r"^\s*(\d+)\s*\|[^\n|]+\|[^\n|]+\|\s*(\d+)\s*\|\s*(\d+)\s*$",
     re.M,
@@ -80,7 +84,10 @@ def first(tags: dict[str, list[str]], *keys: str) -> str:
 def text_file(path: Path) -> str:
     raw = path.read_bytes()
     if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
-        return raw.decode("utf-16")
+        try:
+            return raw.decode("utf-16")
+        except UnicodeDecodeError as error:
+            raise Review(f"invalid UTF-16 text in {path.name}") from error
     try:
         return raw.decode("utf-8-sig")
     except UnicodeDecodeError:
@@ -117,6 +124,7 @@ class Track:
     rate: int
     pcm_md5: int
     tags: dict[str, list[str]]
+    channels: int = 2
 
     @property
     def isrc(self) -> str:
@@ -145,10 +153,21 @@ class Release:
     files: dict[Path, tuple[int, int, int, int, int]]
     cue_isrcs: dict[tuple[int, int], str]
     rip_logs: dict[str, str] = field(default_factory=dict)
+    cue_notes: dict[str, str] = field(default_factory=dict)
 
     @property
     def tags(self) -> dict[str, list[str]]:
         return self.tracks[0].tags
+
+    def isrc_for(self, track: Track) -> str:
+        return track.isrc or self.cue_isrcs.get((track.disc, track.number), "")
+
+
+@dataclass
+class CueTrack:
+    file_line: int
+    track: Track
+    isrc: str = ""
 
 
 def number(value: str, label: str) -> int:
@@ -161,12 +180,16 @@ def number(value: str, label: str) -> int:
     return n
 
 
-def disc_number(path: Path) -> int:
+def parent_disc(path: Path) -> int | None:
     for part in reversed(path.parent.parts):
         match = DISC.fullmatch(part)
         if match:
             return int(match[1])
-    return 1
+    return None
+
+
+def disc_number(path: Path) -> int:
+    return parent_disc(path) or 1
 
 
 def read_track(root: Path, path: Path) -> Track:
@@ -191,7 +214,86 @@ def read_track(root: Path, path: Path) -> Track:
         audio.info.sample_rate,
         audio.info.md5_signature,
         tags,
+        channels=audio.info.channels,
     )
+
+
+def audio_reference(value: str, sidecar: Path, tracks: list[Track]) -> Track:
+    src = Path(value.replace("\\", "/"))
+    path = Path(os.path.normpath(sidecar.parent / src))
+    exact = [
+        t for t in tracks if t.path == path or t.path.with_suffix(src.suffix) == path
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    matches = [
+        t
+        for t in tracks
+        if t.path.parent == path.parent
+        and normalize(t.path.stem) == normalize(path.stem)
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    # Rippers can record absolute and Windows paths. Only staged tracks are resolved.
+    matches = [t for t in tracks if normalize(t.path.stem) == normalize(src.stem)]
+    if len(matches) == 1:
+        return matches[0]
+    prefix = re.match(r"^(\d+)(?:[ ._-]|$)", src.stem)
+    if prefix and AUDIO_REF.search(value):
+        matches = [
+            t
+            for t in tracks
+            if t.disc == disc_number(sidecar) and t.number == int(prefix[1])
+        ]
+        if len(matches) == 1:
+            return matches[0]
+    raise Review(f"cannot resolve {value!r} in {sidecar}")
+
+
+def cue_tracks(lines: list[str], path: Path, tracks: list[Track]) -> list[CueTrack]:
+    result = []
+    files = set()
+    current = None
+    position = None
+    indexed = False
+    code = ""
+    for index, line in enumerate(lines):
+        if re.match(r"^\s*FILE\b", line, re.I):
+            match = CUE_FILE.fullmatch(line)
+            if not match:
+                raise Review(f"unsupported cue FILE line in {path}")
+            track = audio_reference(match[2], path, tracks)
+            if track.path in files:
+                raise Review(f"duplicate cue file reference in {path}")
+            files.add(track.path)
+            current = CueTrack(index, track)
+        elif match := CUE_TRACK.fullmatch(line):
+            if position is not None and not indexed:
+                raise Review(f"cue track {position:02d} has no INDEX 01 in {path}")
+            position, indexed, code = int(match[1]), False, ""
+        elif CUE_INDEX.fullmatch(line):
+            # EAC can place FILE after TRACK and INDEX 00. INDEX 01
+            # identifies the audio file where this track actually begins.
+            if current is None or position is None or indexed:
+                raise Review(
+                    f"cue refers to an image or contains unmapped tracks: {path}"
+                )
+            if current.track.number != position:
+                raise Review(
+                    f"cue track {position:02d} points to {current.track.path} in {path}"
+                )
+            current.isrc = code
+            result.append(current)
+            current, indexed = None, True
+        elif position is not None:
+            match = re.fullmatch(r"\s*ISRC\s+([A-Z0-9]+)\s*", line, re.I)
+            if match and CUE_ISRC.fullmatch(match[1].upper()):
+                code = match[1].upper()
+                if indexed:
+                    result[-1].isrc = code
+    if not indexed or len(result) != len(files):
+        raise Review(f"cue contains unmapped tracks: {path}")
+    return result
 
 
 def read_toc(log: str, tracks: list[Track]) -> Toc | None:
@@ -353,7 +455,10 @@ def read_release(root: Path) -> Release:
             raise Review(f"disc {disc} has duplicate or missing track numbers")
     album = agreed([first(t.tags, "album") for t in tracks], normalize, "album titles")
     album_artist = agreed(
-        [artist_credit(t.tags, "albumartist", "album artist") for t in tracks],
+        [
+            artist_credit(t.tags, "albumartist", "album artist", "albumartists")
+            for t in tracks
+        ],
         normalize,
         "album artists",
     )
@@ -361,52 +466,80 @@ def read_release(root: Path) -> Release:
     artist = album_artist or fallback_artist
     if not artist:
         artist = agreed(
-            [artist_credit(t.tags, "artist") for t in tracks], normalize, "artists"
+            [artist_credit(t.tags, "artist", "artists") for t in tracks],
+            normalize,
+            "artists",
         )
     album = album or fallback_title
     if not artist or not album:
         raise Review("missing album title or album artist")
-    existing_barcode = [first(t.tags, "barcode", "upc", "mcn") for t in tracks]
+    existing_barcode = [
+        next(
+            (
+                code
+                for key in ("barcode", "upc", "mcn")
+                if barcode_key(code := first(t.tags, key))
+            ),
+            "",
+        )
+        for t in tracks
+    ]
     cue_barcodes = []
     cue_codes: dict[tuple[int, int], set[str]] = {}
+    cue_notes = {}
     tocs = []
     rip_logs = {}
     cd_log = False
     for path in paths:
         if path.suffix.lower() == ".cue":
-            cue = text_file(root / path)
-            cue_barcodes += re.findall(
-                r"^\s*CATALOG\s+([0-9]{8,14})\s*$", cue, re.M | re.I
-            )
-            disc = disc_number(path)
-            valid_positions = {t.number for t in tracks if t.disc == disc}
-            position = 0
-            for line in cue.splitlines():
-                track = re.match(r"\s*TRACK\s+(\d+)\s+AUDIO\b", line, re.I)
-                if track:
-                    position = int(track[1])
-                code = re.match(r"\s*ISRC\s+([A-Z0-9]+)\s*$", line, re.I)
-                if (
-                    code
-                    and position in valid_positions
-                    and CUE_ISRC.fullmatch(code[1].upper())
-                ):
-                    cue_codes.setdefault((disc, position), set()).add(code[1].upper())
+            try:
+                cue = text_file(root / path)
+                mapped = cue_tracks(cue.splitlines(), path, tracks)
+            except Review as error:
+                cue_notes[path.as_posix()] = str(error)
+                continue
+            cue_barcodes += [
+                code
+                for code in re.findall(
+                    r"^\s*CATALOG\s+([0-9]{8,14})\s*$", cue, re.M | re.I
+                )
+                if valid_gtin(code)
+            ]
+            for entry in mapped:
+                if entry.isrc:
+                    cue_codes.setdefault(
+                        (entry.track.disc, entry.track.number), set()
+                    ).add(entry.isrc)
         if path.suffix.lower() != ".log":
             continue
-        log = text_file(root / path)
+        try:
+            log = text_file(root / path)
+        except Review as error:
+            rip_logs[path.as_posix()] = str(error)
+            continue
         ripper = ripper_name(log)
         if not ripper:
             rip_logs[path.as_posix()] = "format is not recognized as a CD rip log"
             continue
         cd_log = True
-        disc = disc_number(path)
-        toc = read_toc(log, [t for t in tracks if t.disc == disc])
+        disc = parent_disc(path)
+        suffix = re.search(
+            r"(?:^|[\s._(\[-])(?:cd|disc|disk)\s*0*(\d+)[)\]]?$", path.stem, re.I
+        )
+        if disc is None and suffix:
+            disc = int(suffix[1])
+        options = [disc] if disc is not None else discs
+        matching = [
+            toc
+            for n in options
+            if (toc := read_toc(log, [t for t in tracks if t.disc == n]))
+        ]
+        toc = matching[0] if len(matching) == 1 else None
         rip_logs[path.as_posix()] = (
-            f"verified disc {disc} TOC ({toc.id})"
+            f"verified disc {toc.disc} TOC ({toc.id})"
             if toc
             else (
-                f"{ripper} log found, but the disc {disc} table of contents could not be verified against the FLACs"
+                f"{ripper} log found, but its table of contents could not be assigned to one FLAC disc"
             )
         )
         if toc and toc not in tocs:
@@ -435,4 +568,5 @@ def read_release(root: Path) -> Release:
         entries,
         {key: next(iter(codes)) for key, codes in cue_codes.items() if len(codes) == 1},
         rip_logs,
+        cue_notes,
     )

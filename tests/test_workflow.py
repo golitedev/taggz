@@ -13,11 +13,11 @@ from unittest.mock import patch
 
 from mutagen.flac import FLAC
 
-from taggz.catalog import Catalog, Edition, Entry
+from taggz.catalog import Catalog, Edition, Entry, from_discogs, from_musicbrainz
 from taggz.config import load_config
 from taggz.match import Library, common, propose, score, select
 from taggz.release import Review, read_release, read_toc
-from taggz.storage import Staging, atomic_json, read_header
+from taggz.storage import Staging, atomic_json, read_header, replaygain_skip_reason
 
 
 @unittest.skipUnless(
@@ -37,17 +37,21 @@ class Workflow(unittest.TestCase):
             f'[paths]\nstaging = "{self.staging}"\nlibrary = "{self.library}"\n',
             encoding="utf-8",
         )
-        wav = self.root / "fixture.wav"
-        with wave.open(str(wav), "wb") as audio:
-            audio.setparams((2, 2, 44100, 0, "NONE", "not compressed"))
-            audio.writeframes(b"\x10\x00\xf0\xff" * 44100)
-        self.flac = self.root / "fixture.flac"
-        subprocess.run(["flac", "--silent", "-o", str(self.flac), str(wav)], check=True)
+        self.flac = self.make_flac(44100)
 
-    def track(self, folder, name="Track01.flac", **tags):
+    def make_flac(self, rate):
+        wav = self.root / f"fixture-{rate}.wav"
+        with wave.open(str(wav), "wb") as audio:
+            audio.setparams((2, 2, rate, 0, "NONE", "not compressed"))
+            audio.writeframes(b"\x10\x00\xf0\xff" * rate)
+        flac = wav.with_suffix(".flac")
+        subprocess.run(["flac", "--silent", "-o", str(flac), str(wav)], check=True)
+        return flac
+
+    def track(self, folder, name="Track01.flac", *, fixture=None, **tags):
         folder.mkdir(exist_ok=True)
         target = folder / name
-        shutil.copyfile(self.flac, target)
+        shutil.copyfile(fixture or self.flac, target)
         audio = FLAC(target)
         for key, value in tags.items():
             audio[key] = [value]
@@ -192,6 +196,8 @@ class Workflow(unittest.TestCase):
         destination = self.staging / "completed" / preview["folder"]
         destination.mkdir(parents=True)
         (destination / "cover.jpg").write_bytes(b"original cover")
+        (preview,) = self.run_cli(expected=1)
+        self.assertIn("already exists", preview["reason"])
         (report,) = self.run_cli("--apply", expected=1)
         self.assertIn("already exists", report["reason"])
         self.assertEqual(report["phase"], "prepare completed destination")
@@ -222,6 +228,108 @@ class Workflow(unittest.TestCase):
         self.assertIn("staging is CD, candidate is Digital Media", candidate["reason"])
         saved = json.loads(Path(report["report_file"]).read_text())
         self.assertEqual(saved["candidates"], report["candidates"])
+
+    def test_mixed_sample_rates_skip_replaygain_and_complete(self):
+        staged, library = self.pair()
+        high_rate = self.make_flac(48000)
+        for seed in (staged, library):
+            tags = {key: values[0] for key, values in FLAC(seed).items()}
+            self.track(
+                seed.parent,
+                "Track02.flac",
+                fixture=high_rate,
+                **(
+                    tags
+                    | {"tracknumber": "2", "title": "Other", "isrc": "GBABC2400002"}
+                ),
+            )
+        audio = FLAC(staged)
+        audio["replaygain_track_gain"] = ["-5.00 dB"]
+        audio.save()
+        (preview,) = self.run_cli()
+        self.assertIn("common sample rate", preview["replaygain_skip_reason"])
+        (report,) = self.run_cli("--apply")
+        destination = Path(report["destination"])
+        self.assertFalse(report["verification"]["replaygain_calculated"])
+        self.assertEqual(
+            FLAC(destination / "01 - Song.flac")["replaygain_track_gain"], ["-5.00 dB"]
+        )
+        self.assertEqual(FLAC(destination / "02 - Other.flac").info.sample_rate, 48000)
+
+    def test_mixed_bit_depths_and_channels_skip_replaygain(self):
+        staged, _ = self.pair()
+        release = read_release(staged.parent)
+        original = release.tracks[0]
+        release.tracks = [original, replace(original, number=2, bits=24)]
+        self.assertIn("common bit depth", replaygain_skip_reason(release))
+        release.tracks[1] = replace(original, number=2, channels=1)
+        self.assertIn("common channel count", replaygain_skip_reason(release))
+
+    def test_cue_isrcs_follow_index_one_across_eac_file_boundaries(self):
+        staged, library = self.pair()
+        for seed in (staged, library):
+            tags = {key: values[0] for key, values in FLAC(seed).items()}
+            del tags["isrc"]
+            self.track(
+                seed.parent,
+                "Track02.flac",
+                **(tags | {"tracknumber": "2", "title": "Other"}),
+            )
+        del_audio = FLAC(staged)
+        del del_audio["isrc"]
+        del_audio.save()
+        cue = staged.parent / "rip.cue"
+        contents = (
+            'FILE "Track01.wav" WAVE\n  TRACK 01 AUDIO\n'
+            "    ISRC GBABC2400001\n    INDEX 01 00:00:00\n"
+            "  TRACK 02 AUDIO\n    ISRC GBABC2400002\n    INDEX 00 00:00:71\n"
+            'FILE "Track02.wav" WAVE\n    INDEX 01 00:00:00\n'
+        )
+        cue.write_text(contents)
+        release = read_release(staged.parent)
+        release.barcode = release.date = ""
+        candidate = Edition(
+            "Artist",
+            "Album",
+            "2024",
+            "Digital Media",
+            [
+                Entry(1, t.number, t.title, 1, {"isrc": [f"GBABC240000{t.number}"]})
+                for t in release.tracks
+            ],
+            "catalog",
+        )
+        self.assertIn("ISRCs", score(release, candidate).evidence)
+        (report,) = self.run_cli("--apply")
+        finished = Path(report["destination"])
+        self.assertEqual(report["input"]["cue_isrc_count"], 2)
+        self.assertEqual(FLAC(finished / "02 - Other.flac")["isrc"], ["GBABC2400002"])
+        self.assertIn(
+            'FILE "02 - Other.flac" WAVE', (finished / cue.name).read_text("utf-8-sig")
+        )
+
+    def test_cue_with_mismatched_track_number_cannot_supply_isrc(self):
+        staged, _ = self.pair()
+        cue = staged.parent / "rip.cue"
+        cue.write_text(
+            'FILE "Track01.wav" WAVE\n  TRACK 02 AUDIO\n'
+            "    ISRC GBABC2400002\n    INDEX 01 00:00:00\n"
+        )
+        (report,) = self.run_cli(expected=1)
+        self.assertEqual(report["input"]["cue_isrc_count"], 0)
+        self.assertIn("cue track 02 points to", report["input"]["cue_notes"][cue.name])
+        self.assertEqual(report["phase"], "plan sidecars")
+
+    def test_flat_cd_rip_logs_are_assigned_by_disc_suffix(self):
+        staged, _ = self.pair()
+        tags = {key: values[0] for key, values in FLAC(staged).items()}
+        self.track(staged.parent, "Disc2Track01.flac", **(tags | {"discnumber": "2"}))
+        for disc in (1, 2):
+            (staged.parent / f"Artist - Album CD{disc}.log").write_text(
+                "Exact Audio Copy\nTOC of the extracted CD\n1 | 0:00.00 | 0:01.00 | 0 | 74\n"
+            )
+        release = read_release(staged.parent)
+        self.assertEqual({toc.disc for toc in release.tocs}, {1, 2})
 
     def test_toc_tie_keeps_recordings_but_not_pressing_identity(self):
         staged, _ = self.pair()
@@ -467,6 +575,91 @@ class Workflow(unittest.TestCase):
         ):
             (edition,) = catalog.musicbrainz(release)
         self.assertEqual(edition.tags["musicbrainz_albumid"], [new_id])
+
+    def test_discogs_slug_link_supplements_one_edition_with_sparse_credits(self):
+        staged, library = self.pair()
+        library.unlink()
+        release = read_release(staged.parent)
+        catalog = Catalog(load_config(self.config), offline=True)
+        preferred = from_musicbrainz(
+            {
+                "id": "album",
+                "title": "Album",
+                "relations": [
+                    {
+                        "type": "discogs",
+                        "url": {
+                            "resource": "https://www.discogs.com/es/release/12345-Artist-Album"
+                        },
+                    }
+                ],
+            }
+        )
+        preferred = replace(
+            preferred,
+            artist="Artist",
+            medium="Digital Media",
+            tags={"barcode": [release.barcode]},
+            tracks=[Entry(1, 1, "Song", 1.0)],
+        )
+        linked = from_discogs(
+            {
+                "id": 12345,
+                "title": "Album",
+                "artists": [{"name": "Artist"}],
+                "formats": [{"name": "File"}],
+                "tracklist": [
+                    {
+                        "position": "1",
+                        "type_": "track",
+                        "title": "Song",
+                        "extraartists": [
+                            {"name": "A Mastering Engineer", "role": "Mastered By"}
+                        ],
+                    }
+                ],
+            }
+        )
+        diagnostics = {}
+        with (
+            patch.object(catalog, "musicbrainz", return_value=[preferred]),
+            patch.object(catalog, "discogs", return_value=[linked]) as fetch,
+        ):
+            proposal = propose(release, Library(self.library), catalog, diagnostics)
+        self.assertEqual(fetch.call_args.args[1], [linked.source])
+        self.assertEqual(proposal.tracks[0].tags["mastering"], ["A Mastering Engineer"])
+        self.assertEqual(diagnostics["candidates"][-1]["decision"], "supplemental")
+
+    def test_discogs_vinyl_sides_map_to_disc_positions(self):
+        edition = from_discogs(
+            {
+                "id": 12345,
+                "title": "Album",
+                "formats": [{"name": "Vinyl"}],
+                "tracklist": [
+                    {"position": side, "type_": "track", "title": side}
+                    for side in ("A1", "A2", "B1", "C1", "D1")
+                ],
+            }
+        )
+        self.assertEqual(
+            [(entry.disc, entry.number) for entry in edition.tracks],
+            [(1, 1), (1, 2), (1, 3), (2, 1), (2, 2)],
+        )
+        self.assertEqual(edition.tracks[-1].tags["vinylposition"], ["D1"])
+
+    def test_multiple_source_artists_are_retained_without_catalog_credits(self):
+        staged, library = self.pair()
+        audio = FLAC(staged)
+        audio["artist"] = ["Artist", "Guest"]
+        audio.save()
+        reference = FLAC(library)
+        del reference["artist"]
+        reference.save()
+        (report,) = self.run_cli("--apply")
+        tagged = FLAC(Path(report["destination"]) / "01 - Song.flac")
+        self.assertEqual(tagged["artist"], ["Artist, Guest"])
+        self.assertEqual(tagged["artists"], ["Artist", "Guest"])
 
     def test_interrupted_publish_restores_original_on_next_apply(self):
         staged, _ = self.pair()

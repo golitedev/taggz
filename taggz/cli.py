@@ -15,7 +15,7 @@ from .config import load_config
 from .match import Library, propose
 from .release import Release, Review, read_release
 from .sidecars import plan_sidecars
-from .storage import RESERVED, Staging, staging_lock
+from .storage import RESERVED, Staging, replaygain_skip_reason, staging_lock, vacant
 
 
 def release_paths(root: Path, names: list[str]) -> list[Path]:
@@ -62,6 +62,7 @@ def input_evidence(release: Release) -> dict:
             str(p) for p in release.files if p.suffix.casefold() == ".cue"
         ),
         "cue_isrc_count": len(release.cue_isrcs),
+        "cue_notes": release.cue_notes,
         "disc_ids": [{"disc": toc.disc, "id": toc.id} for toc in release.tocs],
     }
 
@@ -125,8 +126,16 @@ def run(args) -> tuple[list[dict], int]:
                     for item in sidecars
                     if item.old != item.new or item.contents is not None
                 ]
-                report["replaygain"] = cfg.replaygain
+                skip = replaygain_skip_reason(release) if cfg.replaygain else ""
+                report["replaygain"] = cfg.replaygain and not skip
+                if skip:
+                    report["replaygain_skip_reason"] = skip
                 report["provider_errors"] = sorted(catalog.errors)
+                report["phase"] = "prepare completed destination"
+                if not vacant(state.completed / proposal.folder):
+                    raise Review(
+                        f"completed destination already exists: {proposal.folder}"
+                    )
                 if args.apply:
                     if not args.json:
                         print(
@@ -134,8 +143,9 @@ def run(args) -> tuple[list[dict], int]:
                             file=sys.stderr,
                             flush=True,
                         )
-                    report["phase"] = "prepare completed destination"
-                    state.apply(proposal, sidecars, report, replaygain=cfg.replaygain)
+                    state.apply(
+                        proposal, sidecars, report, replaygain=report["replaygain"]
+                    )
                 else:
                     report["phase"] = "preview ready"
                 reports.append(report)
@@ -183,6 +193,8 @@ def render(reports: list[dict], apply: bool) -> None:
                 print(
                     f"  Cue sheets: {', '.join(item['cue_sheets'])} ({item['cue_isrc_count']} ISRCs)"
                 )
+            for sheet, reason in item["cue_notes"].items():
+                print(f"  Cue sheet {sheet}: {reason}")
             for key, name in (
                 ("barcode", "Barcode"),
                 ("catalog_number", "Catalog number"),
@@ -220,6 +232,8 @@ def render(reports: list[dict], apply: bool) -> None:
                 )
             if row["replaygain"]:
                 print(f"  ReplayGain: {'calculated' if apply else 'will calculate'}")
+            elif reason := row.get("replaygain_skip_reason"):
+                print(f"  ReplayGain skipped: {reason}")
         for candidate in row["candidates"]:
             print(
                 f"  Candidate {candidate['decision']}: {candidate['artist']} — {candidate['title']} "

@@ -13,10 +13,23 @@ from uuid import uuid4
 from mutagen.flac import FLAC
 
 from .match import Proposal
-from .release import Review, signature, snapshot
+from .release import Release, Review, signature, snapshot
 from .sidecars import Sidecar
 
 RESERVED = {"completed", "needs-review"}
+
+
+def replaygain_skip_reason(release: Release) -> str:
+    if len({track.rate for track in release.tracks}) > 1:
+        return "metaflac requires a common sample rate for album ReplayGain"
+    if len({track.bits for track in release.tracks}) > 1:
+        return "metaflac requires a common bit depth for album ReplayGain"
+    channels = {track.channels for track in release.tracks}
+    if not channels <= {1, 2}:
+        return "metaflac supports mono and stereo tracks for ReplayGain"
+    if len(channels) > 1:
+        return "metaflac requires a common channel count for album ReplayGain"
+    return ""
 
 
 def atomic_json(path: Path, data: dict) -> None:
@@ -319,7 +332,18 @@ class Staging:
                 timeout=600,
             )
             if result.returncode:
-                raise Review(f"ReplayGain failed: {result.stderr.strip()}")
+                error = result.stderr.strip()
+                if not re.search(
+                    r": ERROR: sample rate of \d+ Hz is not supported$", error
+                ):
+                    raise Review(
+                        f"ReplayGain failed: {error or f'exit {result.returncode}'}"
+                    )
+                replaygain = False
+                report["replaygain"] = False
+                report["replaygain_skip_reason"] = (
+                    f"metaflac does not support {proposal.tracks[0].track.rate} Hz for ReplayGain"
+                )
         expected_gain = {
             "replaygain_track_gain",
             "replaygain_track_peak",
@@ -345,11 +369,12 @@ class Staging:
                 raise Review(
                     f"audio stream information or artwork changed: {entry.path}"
                 )
-            if any(
-                tagged.get(key) != value
-                for key, value in entry.tags.items()
-                if not replaygain or key not in gain_fields
-            ):
+            written = dict(tagged.tags or {})
+            expected = entry.tags
+            unmanaged = written.keys() | expected.keys()
+            if replaygain:
+                unmanaged -= gain_fields
+            if any(written.get(key) != expected.get(key) for key in unmanaged):
                 raise Review(f"written tags failed verification: {entry.path}")
             if replaygain and not expected_gain <= set(tagged.keys()):
                 raise Review(f"missing ReplayGain tags: {entry.path}")

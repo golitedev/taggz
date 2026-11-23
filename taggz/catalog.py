@@ -5,7 +5,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from .config import Config
@@ -19,7 +19,7 @@ class Entry:
     title: str
     seconds: float | None
     tags: dict[str, list[str]] = field(default_factory=dict)
-    pcm: tuple[int, int, int] | None = None
+    pcm: tuple[int, int, int, int] | None = None
 
 
 @dataclass
@@ -64,6 +64,14 @@ def display_credits(credits: list[dict]) -> tuple[str, list[str]]:
         name + credit.get("joinphrase", "") for name, credit in zip(names, credits)
     )
     return display.strip(), names
+
+
+def discogs_release_id(link: str) -> str:
+    url = urlsplit(link)
+    if url.hostname not in {"discogs.com", "www.discogs.com", "api.discogs.com"}:
+        return ""
+    match = re.match(r"^/(?:[a-z]+/)?releases?/(\d+)(?:[-/]|$)", url.path, re.I)
+    return match[1] if match else ""
 
 
 def relation_fields(recording: dict) -> dict[str, list[str]]:
@@ -171,12 +179,12 @@ def from_musicbrainz(data: dict) -> Edition:
     )
     if genres:
         tags["genre"] = [genres[0]["name"]]
-    link = next(
+    discogs_id = next(
         (
-            x["url"]["resource"]
+            code
             for x in data.get("relations", [])
             if x.get("type") == "discogs"
-            and "/release/" in x.get("url", {}).get("resource", "")
+            and (code := discogs_release_id(x.get("url", {}).get("resource", "")))
         ),
         "",
     )
@@ -194,7 +202,7 @@ def from_musicbrainz(data: dict) -> Edition:
         f"https://musicbrainz.org/release/{data['id']}",
         tags,
         discids,
-        link,
+        f"https://www.discogs.com/release/{discogs_id}" if discogs_id else "",
         aliases,
         data.get("disambiguation") or "",
         download_links,
@@ -203,18 +211,31 @@ def from_musicbrainz(data: dict) -> Edition:
 
 def from_discogs(data: dict) -> Edition:
     artists = [re.sub(r" \(\d+\)$", "", a["name"]) for a in data.get("artists", [])]
-    formats = {medium_name(f["name"]) for f in data.get("formats", [])}
+    formats = {
+        "Digital Media" if f["name"] == "File" else medium_name(f["name"])
+        for f in data.get("formats", [])
+    }
     medium = formats.pop() if len(formats) == 1 else ""
     entries = []
+    positions = defaultdict(int)
     for item in data.get("tracklist", []):
         if item.get("type_") != "track" or not item.get("position"):
             continue
         position = item["position"]
-        match = re.fullmatch(r"(\d+)[-.](\d+)", position)
-        disc, pos = (int(match[1]), int(match[2])) if match else (1, len(entries) + 1)
+        match = re.fullmatch(r"(?:CD\s*)?(\d+)[-.](\d+)", position, re.I)
+        side = (
+            re.fullmatch(r"([A-Z])\d+", position, re.I) if medium == "Vinyl" else None
+        )
+        disc = 1
+        if match:
+            disc = int(match[1])
+        elif side:
+            disc = (ord(side[1].upper()) - ord("A")) // 2 + 1
+        pos = int(match[2]) if match else positions[disc] + 1
+        positions[disc] = pos
         if item.get("sub_tracks"):
             return Edition("", "", "", "", [], "")
-        duration = item.get("duration", "").split(":")
+        duration = (item.get("duration") or "").split(":")
         seconds = (
             int(duration[0]) * 60 + int(duration[1])
             if len(duration) == 2 and all(p.isdigit() for p in duration)
@@ -258,7 +279,7 @@ def from_discogs(data: dict) -> Edition:
         genre=(data.get("styles") or data.get("genres") or [])[:1],
         discogs_releaseid=str(data["id"]),
     )
-    date = data.get("released", "").strip()
+    date = (data.get("released") or "").strip()
     if date.endswith("-00-00"):
         date = date[:4]
     elif date.endswith("-00"):
@@ -415,11 +436,7 @@ class Catalog:
     def discogs(self, release: Release, links: list[str]) -> list[Edition]:
         if self.offline or not self.config.discogs:
             return []
-        ids = set()
-        for link in links:
-            match = re.search(r"discogs\.com/(?:[a-z]+/)?release/(\d+)", link)
-            if match:
-                ids.add(match[1])
+        ids = {code for link in links if (code := discogs_release_id(link))}
         if os.environ.get(self.config.discogs_token_env):
             for key, value in (
                 ("barcode", release.barcode),
