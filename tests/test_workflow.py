@@ -13,9 +13,9 @@ from unittest.mock import patch
 
 from mutagen.flac import FLAC
 
-from taggz.catalog import Edition, Entry
+from taggz.catalog import Catalog, Edition, Entry
 from taggz.config import load_config
-from taggz.match import common, score, select
+from taggz.match import Library, common, propose, score, select
 from taggz.release import Review, read_release, read_toc
 from taggz.storage import Staging, atomic_json, read_header
 
@@ -337,6 +337,136 @@ class Workflow(unittest.TestCase):
         bad = entries[:]
         bad[2] = replace(entries[2], title="Underground")
         self.assertIsNone(score(release, replace(first, tracks=bad)))
+
+    def test_xld_log_and_compound_cd_folder_keep_the_physical_medium(self):
+        staged, _ = self.pair()
+        root = staged.parent.rename(
+            self.staging / "Artist - Album (2024) [Label, 602465081497] [FLAC-CD]"
+        )
+        audio = FLAC(root / staged.name)
+        del audio["barcode"]
+        audio.save()
+        release = read_release(root)
+        self.assertEqual(release.medium, "CD")
+        self.assertEqual(release.barcode, "602465081497")
+
+        root = root.rename(self.staging / "Artist - Album [FLAC]")
+        (root / "rip.log").write_text(
+            "X Lossless Decoder version 20230627\n\n"
+            "XLD extraction logfile\n\n"
+            "TOC of the extracted CD\n1 | 0:00.00 | 0:01.00 | 0 | 74\n"
+        )
+        release = read_release(root)
+        self.assertEqual(release.medium, "CD")
+        self.assertEqual(release.tocs[0].query, "1 1 225 150")
+
+    def test_program_match_keeps_staged_edition_identifiers(self):
+        staged, library = self.pair()
+        for number in (2, 3, 4, 5):
+            for reference in (staged, library):
+                tags = {key: values[0] for key, values in FLAC(reference).items()}
+                tags.update(tracknumber=str(number), isrc=f"GBABC240000{number}")
+                self.track(reference.parent, f"{number:02d} - Song.flac", **tags)
+        for track in staged.parent.glob("*.flac"):
+            audio = FLAC(track)
+            audio["barcode"] = ["602465081497"]
+            audio.save()
+        (report,) = self.run_cli()
+        self.assertEqual(report["match_scope"], "track program")
+        self.assertNotIn("qobuz_album_id", report["tracks"][0]["fields"])
+        self.assertNotIn("barcode", report["tracks"][0]["fields"])
+        self.assertEqual(report["tracks"][0]["fields"]["composer"], ["A Writer"])
+        self.assertEqual(report["withheld_release_fields"], ["qobuz_album_id"])
+        candidate = report["candidates"][0]
+        self.assertEqual(candidate["matching_pcm_checksums"], 5)
+        self.assertEqual(candidate["matching_isrcs"], 5)
+        self.assertIn("barcode differs", candidate["edition_reason"])
+
+    def test_verified_cd_program_can_use_web_track_list_without_web_ids(self):
+        staged, library = self.pair()
+        library.unlink()
+        tags = {key: values[0] for key, values in FLAC(staged).items()}
+        for number in (2, 3):
+            self.track(
+                staged.parent,
+                f"{number:02d} - Song.flac",
+                **(tags | {"tracknumber": str(number), "title": f"Song {number}"}),
+            )
+        (staged.parent / "rip.log").write_text(
+            "X Lossless Decoder\nTOC of the extracted CD\n"
+            "1 | start | length | 0 | 74\n"
+            "2 | start | length | 75 | 149\n"
+            "3 | start | length | 150 | 224\n"
+        )
+        release = read_release(staged.parent)
+        catalog = Catalog(load_config(self.config), offline=True)
+        entries = [
+            Entry(1, t.number, t.title, 1.0, {"qobuz_track_id": [str(t.number)]})
+            for t in release.tracks
+        ]
+        other = Edition(
+            "Artist",
+            "Album",
+            "2025-04-01",
+            "Digital Media",
+            entries,
+            "web",
+            {"qobuz_album_id": ["other"], "barcode": ["602465081497"]},
+        )
+        with patch.object(catalog, "musicbrainz", return_value=[other]):
+            proposal = propose(release, Library(self.library), catalog, {})
+        self.assertIn("CD rip tables", proposal.evidence)
+        self.assertIn("(2024) [CD]", proposal.folder)
+        self.assertEqual(proposal.tracks[0].tags["media"], ["CD"])
+        self.assertEqual(proposal.tracks[0].tags["barcode"], [tags["barcode"]])
+        self.assertNotIn("qobuz_album_id", proposal.tracks[0].tags)
+        self.assertNotIn("qobuz_track_id", proposal.tracks[0].tags)
+
+    def test_named_version_wins_over_the_generic_release(self):
+        staged, library = self.pair()
+        library.unlink()
+        release = read_release(
+            staged.parent.rename(self.staging / "Artist - Album (Mix Version)")
+        )
+        catalog = Catalog(load_config(self.config), offline=True)
+        generic = Edition(
+            "Artist",
+            "Album",
+            release.date,
+            "Digital Media",
+            [Entry(1, 1, "Song", 1.0)],
+            "generic",
+        )
+        version = replace(
+            generic,
+            source="explicit",
+            variant="Mix Version",
+            tracks=[Entry(1, 1, "Song (Mix Version)", 1.1)],
+        )
+        with patch.object(catalog, "musicbrainz", return_value=[generic, version]):
+            proposal = propose(release, Library(self.library), catalog, {})
+        self.assertEqual(proposal.sources, ["explicit"])
+        self.assertIn("Album (Mix Version)", proposal.folder)
+
+    def test_musicbrainz_counts_merged_editions_once(self):
+        staged, _ = self.pair()
+        release = read_release(staged.parent)
+        old_id = (
+            "a" * 8 + "-" + "a" * 4 + "-" + "a" * 4 + "-" + "a" * 4 + "-" + "a" * 12
+        )
+        new_id = old_id.replace("a", "b")
+        release.tags["musicbrainz_albumid"] = [old_id]
+        catalog = Catalog(load_config(self.config), offline=False)
+        detail = {
+            "id": new_id,
+            "title": "Album",
+            "media": [{"format": "Digital Media"}],
+        }
+        with patch.object(
+            catalog, "get", side_effect=[{"releases": [{"id": new_id}]}, detail, detail]
+        ):
+            (edition,) = catalog.musicbrainz(release)
+        self.assertEqual(edition.tags["musicbrainz_albumid"], [new_id])
 
     def test_interrupted_publish_restores_original_on_next_apply(self):
         staged, _ = self.pair()

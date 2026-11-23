@@ -9,7 +9,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from .config import Config
-from .release import Release, first
+from .release import Release, first, normalize
 
 
 @dataclass
@@ -19,6 +19,7 @@ class Entry:
     title: str
     seconds: float | None
     tags: dict[str, list[str]] = field(default_factory=dict)
+    pcm: tuple[int, int, int] | None = None
 
 
 @dataclass
@@ -52,6 +53,8 @@ def medium_name(value: str) -> str:
         return value
     if value in ("Enhanced CD", "SACD (CD layer)"):
         return "CD"
+    if "DVD" in value.upper() or "BLU-RAY" in value.upper():
+        return "Video Disc"
     return ""
 
 
@@ -326,21 +329,50 @@ class Catalog:
     def musicbrainz(self, release: Release) -> list[Edition]:
         if self.offline or not self.config.musicbrainz:
             return []
-        ids = set()
+        ids = {}
+
+        def add_ids(result: dict, limit: int = 24) -> None:
+            for item in result.get("releases", [])[:limit]:
+                ids.setdefault(item["id"].lower(), None)
+
         previous = first(release.tags, "musicbrainz_albumid")
         if re.fullmatch(r"[0-9a-fA-F-]{36}", previous):
-            ids.add(previous)
+            ids[previous.lower()] = None
         for toc in release.tocs:
             results = self.get(
                 "MusicBrainz", f"discid/{toc.id}", cdstubs="no", toc=toc.query
             )
-            ids.update(item["id"] for item in results.get("releases", []))
+            if results.get("id") != toc.id:
+                # A fuzzy TOC response can suggest completely unrelated CDs
+                # with similar track lengths.
+                results = {
+                    "releases": [
+                        item
+                        for item in results.get("releases", [])
+                        if normalize(item.get("title", "")) == normalize(release.title)
+                    ]
+                }
+            add_ids(results)
         if not ids or release.barcode or release.catalog:
             queries = []
             if release.barcode:
-                queries.append("barcode:" + re.sub(r"\D", "", release.barcode))
+                code = re.sub(r"\D", "", release.barcode).lstrip("0")
+                if code:
+                    queries.append(
+                        "("
+                        + " OR ".join(
+                            "barcode:" + code.zfill(length)
+                            for length in sorted({len(code), 12, 13, 14})
+                            if length >= len(code)
+                        )
+                        + ")"
+                    )
             if release.catalog:
-                queries.append("catno:" + self.quote(release.catalog))
+                catalog = release.catalog.split()[-1]
+                if re.fullmatch(r"[A-Za-z0-9-]{5,}", catalog) and re.search(
+                    r"\d", catalog
+                ):
+                    queries.append("catno:" + self.quote(catalog))
             if not ids:
                 queries.append(
                     "release:"
@@ -351,20 +383,34 @@ class Catalog:
                 )
             for query in queries:
                 results = self.get("MusicBrainz", "release", query=query, limit=12)
-                ids.update(item["id"] for item in results.get("releases", [])[:8])
+                add_ids(results, 8)
+        if not ids:
+            # The catalog can index a newer stage name or a different artist
+            # credit. Results from this search still need normal verification.
+            results = self.get(
+                "MusicBrainz",
+                "release",
+                query="release:"
+                + self.quote(release.title)
+                + f" AND tracks:{len(release.tracks)}",
+                limit=12,
+            )
+            add_ids(results, 12)
         include = (
             "artists+artist-credits+aliases+recordings+labels+release-groups+discids+isrcs"
             "+url-rels+recording-level-rels+artist-rels+work-rels+work-level-rels+genres"
         )
-        editions = []
-        for identifier in sorted(ids)[:24]:
+        editions = {}
+        for identifier in list(ids)[:24]:
             result = self.get("MusicBrainz", f"release/{identifier}", inc=include)
             if result.get("media"):
                 try:
-                    editions.append(from_musicbrainz(result))
+                    # MusicBrainz resolves old IDs for merged releases.
+                    edition = from_musicbrainz(result)
+                    editions.setdefault(edition.source, edition)
                 except (KeyError, TypeError, ValueError):
                     self.errors.add("MusicBrainz returned an incomplete release")
-        return editions
+        return list(editions.values())
 
     def discogs(self, release: Release, links: list[str]) -> list[Edition]:
         if self.offline or not self.config.discogs:

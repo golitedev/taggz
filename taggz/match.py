@@ -1,5 +1,5 @@
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from difflib import SequenceMatcher
 from pathlib import Path
 from unicodedata import normalize as unicode_normalize
@@ -50,7 +50,7 @@ class Match:
     edition: Edition
     rank: int
     evidence: str
-    delta: float
+    program_only: bool = False
 
 
 @dataclass
@@ -107,18 +107,34 @@ class Proposal:
 
 
 def title_matches(left: str, right: str) -> bool:
-    return normalize(DISC_SUFFIX.sub("", left)) == normalize(DISC_SUFFIX.sub("", right))
+    a, b = (normalize(DISC_SUFFIX.sub("", title)) for title in (left, right))
+    if a == b:
+        return True
+    for roman, numeral in (("ii", "2"), ("iii", "3"), ("iv", "4"), ("volv", "vol5")):
+        if a.endswith(roman) and b == a.removesuffix(roman) + numeral:
+            return True
+        if b.endswith(roman) and a == b.removesuffix(roman) + numeral:
+            return True
+    return False
+
+
+def artist_key(name: str) -> str:
+    return normalize(re.sub(r"\s+y\s+|\s*[,/]\s*", " and ", name, flags=re.I))
 
 
 def media_compatible(source: Release, candidate: Edition) -> bool:
     return bool(
-        candidate.medium and (not source.medium or source.medium == candidate.medium)
+        candidate.medium in {"CD", "Digital Media", "Vinyl"}
+        and (not source.medium or source.medium == candidate.medium)
     )
 
 
 def supported_variant(release: Release, edition: Edition) -> str:
     variant = normalize(edition.variant)
-    if variant and variant in normalize(release.root.name):
+    qualifiers = re.findall(r"\(([^()]+)\)|\[([^\[\]]+)\]", release.root.name)
+    if variant and any(
+        normalize(left or right) == variant for left, right in qualifiers
+    ):
         return variant
     return ""
 
@@ -135,8 +151,40 @@ def cd_title(title: str) -> str:
 
 
 def cd_title_key(title: str) -> str:
-    title = re.sub(r"\(live[,;]\s*[^)]+\)\s*$", "(live)", cd_title(title), flags=re.I)
+    title = re.sub(
+        r"\s*[\[(](?:live|en vivo)(?:[,;]\s*[^)\]]+)?[)\]]\s*$",
+        "(live)",
+        cd_title(title),
+        flags=re.I,
+    )
     return track_key(title)
+
+
+def anchored_title_key(title: str) -> str:
+    title = re.sub(
+        r"\s*[\[(](?:latin pop|album version|bonus track)[)\]]", "", title, flags=re.I
+    )
+    # A named style before the same remix marker is a subtitle, not a reason
+    # to conflate a remix with the unqualified recording.
+    title = re.sub(
+        r"\s*[\[(]versi[oó]n [^)\]]+[)\]](?=\s*[\[(]remix[)\]])",
+        "",
+        title,
+        flags=re.I,
+    )
+    return cd_title_key(title)
+
+
+def position_issue(release: Release, edition: Edition) -> str | None:
+    if len(release.tracks) != len(edition.tracks):
+        return f"track count differs: staging has {len(release.tracks)}, candidate has {len(edition.tracks)}"
+    for source, target in zip(release.tracks, edition.tracks, strict=True):
+        if (source.disc, source.number) != (target.disc, target.number):
+            return (
+                f"track position differs: staging disc {source.disc} track {source.number:02d}, "
+                f"candidate disc {target.disc} track {target.number:02d}"
+            )
+    return None
 
 
 def exact_cd_toc(release: Release, edition: Edition) -> bool:
@@ -148,25 +196,20 @@ def exact_cd_toc(release: Release, edition: Edition) -> bool:
 
 
 def layout_issue(
-    release: Release, edition: Edition, *, exact_toc: bool = False
+    release: Release, edition: Edition, *, anchored: bool = False
 ) -> str | None:
-    if len(release.tracks) != len(edition.tracks):
-        return f"track count differs: staging has {len(release.tracks)}, candidate has {len(edition.tracks)}"
+    if issue := position_issue(release, edition):
+        return issue
     variant = supported_variant(release, edition)
     typos = 0
     for source, target in zip(release.tracks, edition.tracks, strict=True):
-        if (source.disc, source.number) != (target.disc, target.number):
-            return (
-                f"track position differs: staging disc {source.disc} track {source.number:02d}, "
-                f"candidate disc {target.disc} track {target.number:02d}"
-            )
         left, right = track_key(source.title), track_key(target.title)
         if left == right or (variant and right == left + variant):
             continue
         mismatch = f"disc {source.disc} track {source.number:02d} title differs: {source.title!r} vs {target.title!r}"
-        if not exact_toc:
+        if not anchored:
             return mismatch
-        left, right = cd_title_key(source.title), cd_title_key(target.title)
+        left, right = anchored_title_key(source.title), anchored_title_key(target.title)
         if left == right:
             continue
         if (
@@ -174,7 +217,7 @@ def layout_issue(
             or min(len(left), len(right)) < 8
             or re.findall(r"\d+", left) != re.findall(r"\d+", right)
             or left.endswith("live") != right.endswith("live")
-            or SequenceMatcher(None, left, right).ratio() < 0.94
+            or SequenceMatcher(None, left, right).ratio() < 0.92
         ):
             return mismatch
         typos += 1
@@ -191,6 +234,33 @@ def barcode_matches(release: Release, edition: Edition) -> bool:
     )
 
 
+def identifiers(release: Release, edition: Edition) -> tuple[bool, bool, bool]:
+    return (
+        barcode_matches(release, edition),
+        any(
+            catalog_matches(release.catalog, code)
+            for code in edition.tags.get("catalognumber", [])
+        ),
+        any(
+            set(release.tags.get(key, [])) & set(edition.tags.get(key, []))
+            for key in EDITION_IDS - {"barcode", "catalognumber"}
+        ),
+    )
+
+
+def album_identity_matches(
+    release: Release, edition: Edition, *, anchored: bool = False
+) -> bool:
+    aliases = {artist_key(name) for name in {edition.artist, *edition.aliases}}
+    if anchored:
+        aliases |= {artist_key(part) for part in edition.artist.split(" / ")}
+    return artist_key(release.artist) in aliases
+
+
+def same_pcm(track: Track, entry: Entry) -> bool:
+    return bool(track.pcm_md5 and entry.pcm == (track.pcm_md5, track.bits, track.rate))
+
+
 def score(
     release: Release, edition: Edition, *, rejection: list[str] | None = None
 ) -> Match | None:
@@ -205,17 +275,18 @@ def score(
             f"medium does not match: staging is {release.medium or 'unconfirmed'}, "
             f"candidate is {edition.medium or 'unconfirmed'}"
         )
-    aliases = {normalize(name) for name in {edition.artist, *edition.aliases}}
+    toc = exact_cd_toc(release, edition)
+    barcode, catalog, saved_id = identifiers(release, edition)
+    anchored = toc or barcode or catalog or saved_id
     variant = supported_variant(release, edition)
     title_matches_edition = title_matches(release.title, edition.title) or (
         variant and normalize(release.title) == normalize(edition.title) + variant
     )
-    if normalize(release.artist) not in aliases:
+    if not album_identity_matches(release, edition, anchored=anchored):
         return reject(f"album artist differs: {release.artist!r} vs {edition.artist!r}")
     if not title_matches_edition:
         return reject(f"release title differs: {release.title!r} vs {edition.title!r}")
-    toc = exact_cd_toc(release, edition)
-    if issue := layout_issue(release, edition, exact_toc=toc):
+    if issue := position_issue(release, edition):
         return reject(issue)
     if (
         release.barcode
@@ -225,6 +296,17 @@ def score(
         return reject(
             f"barcode differs: {release.barcode} vs {', '.join(edition.tags['barcode'])}"
         )
+    identical = all(
+        same_pcm(t, e) for t, e in zip(release.tracks, edition.tracks, strict=True)
+    )
+    if identical and anchored:
+        return Match(
+            edition,
+            110,
+            "same release identifier and identical decoded audio in the library",
+        )
+    if issue := layout_issue(release, edition, anchored=anchored):
+        return reject(issue)
     durations = [
         (abs(track.seconds - entry.seconds), track.disc, track.number)
         for track, entry in zip(release.tracks, edition.tracks)
@@ -237,21 +319,11 @@ def score(
         if track.isrc and track.isrc in entry.tags.get("isrc", []):
             isrc_votes += 1
 
-    barcode = barcode_matches(release, edition)
-    catalog = any(
-        catalog_matches(release.catalog, code)
-        for code in edition.tags.get("catalognumber", [])
-    )
-    saved_id = any(
-        set(release.tags.get(k, [])) & set(edition.tags.get(k, []))
-        for k in ("musicbrainz_albumid", "qobuz_album_id", "discogs_releaseid")
-    )
     if toc and delta <= 3:
         return Match(
             edition,
             100 + 4 * barcode + 2 * catalog + saved_id,
             "CD table of contents and track order",
-            delta,
         )
     # HDtracks source tags and catalog download links can disambiguate older
     # digital editions with year-only dates and different silence padding.
@@ -269,7 +341,7 @@ def score(
         )
     ):
         return Match(
-            edition, 55, "HDtracks provenance, year, track order and durations", delta
+            edition, 55, "HDtracks provenance, year, track order and durations"
         )
     if delta > 4:
         return reject(
@@ -280,15 +352,27 @@ def score(
         have_durations or isrc_votes or barcode and catalog or saved_id
     ):
         rank = 75 + 8 * barcode + 4 * catalog + 2 * saved_id
-        return Match(
-            edition, rank, "release identifier and matching track order", delta
-        )
+        return Match(edition, rank, "release identifier and matching track order")
     if (
         isrc_votes == len(release.tracks)
         and have_durations
         and release.medium == "Digital Media"
+        and (not release.date or not edition.date or release.date == edition.date)
     ):
-        return Match(edition, 65, "ISRCs, durations and digital track order", delta)
+        return Match(edition, 65, "ISRCs, durations and digital track order")
+    if (
+        variant
+        and edition.medium == "Digital Media"
+        and release.date
+        and release.date[:4] == edition.date[:4]
+        and have_durations
+        and delta <= 1.2
+    ):
+        return Match(
+            edition,
+            54,
+            "named digital version, release year, track order and durations",
+        )
     same_date = edition.date == release.date and len(release.date) == 10
     if (
         same_date
@@ -296,9 +380,7 @@ def score(
         and have_durations
         and delta <= 1.2
     ):
-        return Match(
-            edition, 50, "digital release date, track order and durations", delta
-        )
+        return Match(edition, 50, "digital release date, track order and durations")
     hints = []
     if release.tocs and not toc:
         hints.append("CD disc ID did not match")
@@ -344,7 +426,7 @@ class Library:
         names = [
             path
             for artist, title, path in self.entries
-            if normalize(artist) == normalize(release.artist)
+            if artist_key(artist) == artist_key(release.artist)
             and title_matches(title, release.title)
         ]
         releases = []
@@ -384,6 +466,8 @@ def from_library(release: Release) -> Edition:
     }
     if release.barcode and "barcode" not in tags:
         tags["barcode"] = [release.barcode]
+    if release.catalog and "catalognumber" not in tags:
+        tags["catalognumber"] = [release.catalog]
     entries = [
         Entry(
             t.disc,
@@ -405,6 +489,7 @@ def from_library(release: Release) -> Edition:
                     "qobuz_track_id",
                 }
             },
+            pcm=(t.pcm_md5, t.bits, t.rate) if t.pcm_md5 else None,
         )
         for t in release.tracks
     ]
@@ -417,6 +502,102 @@ def from_library(release: Release) -> Edition:
         f"library: {release.root.name}",
         tags,
         {(toc.disc, toc.id) for toc in release.tocs},
+    )
+
+
+def program_match(release: Release, edition: Edition) -> Match | None:
+    if (
+        not album_identity_matches(release, edition, anchored=True)
+        or not title_matches(release.title, edition.title)
+        or position_issue(release, edition)
+    ):
+        return None
+    pairs = list(zip(release.tracks, edition.tracks, strict=True))
+    exact_audio = all(same_pcm(t, e) for t, e in pairs)
+    shared_codes = [bool(t.isrc and t.isrc in e.tags.get("isrc", [])) for t, e in pairs]
+    delta = max(
+        (abs(t.seconds - e.seconds) for t, e in pairs if e.seconds is not None),
+        default=0,
+    )
+    complete_lengths = all(e.seconds is not None for _, e in pairs)
+    medium = release.medium or (edition.medium if exact_audio else "")
+    if medium not in {"CD", "Digital Media", "Vinyl"}:
+        return None
+    complete_cd_tables = medium == "CD" and {toc.disc for toc in release.tocs} == {
+        t.disc for t in release.tracks
+    }
+    if medium != edition.medium and not (complete_cd_tables and len(pairs) >= 3):
+        return None
+    if exact_audio:
+        rank, evidence = (
+            45,
+            "identical decoded audio and track positions in the library",
+        )
+    elif (
+        complete_cd_tables
+        and layout_issue(release, edition, anchored=True) is None
+        and len(pairs) >= 3
+        and complete_lengths
+        and delta <= 3
+    ):
+        rank, evidence = (
+            40,
+            "CD rip tables, matching titles, track positions and durations",
+        )
+    elif (
+        medium == edition.medium == "Digital Media"
+        and len(pairs) >= 3
+        and sum(shared_codes) * 5 >= len(pairs) * 4
+        and layout_issue(release, edition, anchored=True) is None
+        and complete_lengths
+        and delta <= 0.25
+    ):
+        rank, evidence = (
+            39,
+            "matching digital track positions, durations and most ISRCs",
+        )
+    else:
+        return None
+    if release.medium and release.medium != edition.medium and not release.date:
+        return None
+    safe_fields = {
+        "artist",
+        "artists",
+        "musicbrainz_artistid",
+        "musicbrainz_trackid",
+    } | CREDITS
+    tracks = [
+        replace(
+            e,
+            tags={key: val for key, val in e.tags.items() if key in safe_fields}
+            if exact_audio or shared_code
+            else {},
+        )
+        for (_, e), shared_code in zip(pairs, shared_codes, strict=True)
+    ]
+    return Match(
+        replace(
+            edition,
+            medium=medium,
+            date=release.date or edition.date,
+            tracks=tracks,
+            tags={
+                key: val
+                for key, val in edition.tags.items()
+                if key
+                in {
+                    "albumartists",
+                    "musicbrainz_albumartistid",
+                    "musicbrainz_releasegroupid",
+                    "originaldate",
+                }
+            },
+            discids=set(),
+            lookup="",
+        ),
+        rank,
+        evidence + "; exact edition not established",
+        program_only=True,
     )
 
 
@@ -509,6 +690,14 @@ def propose(
     def assess(edition: Edition) -> Match | None:
         rejection = []
         match = score(release, edition, rejection=rejection)
+        aligned = (
+            list(zip(release.tracks, edition.tracks, strict=True))
+            if (position_issue(release, edition) is None)
+            else []
+        )
+        deltas = [
+            abs(t.seconds - e.seconds) for t, e in aligned if e.seconds is not None
+        ]
         candidates.append(
             {
                 "source": edition.source,
@@ -522,31 +711,25 @@ def propose(
                 "exact_cd_toc": exact_cd_toc(release, edition),
                 "decision": "qualified" if match else "rejected",
                 "reason": match.evidence if match else rejection[0],
-                "maximum_duration_difference_seconds": (
-                    round(match.delta, 3)
-                    if match
-                    and any(entry.seconds is not None for entry in edition.tracks)
-                    else None
+                "compared_durations": len(deltas),
+                "maximum_duration_difference_seconds": round(max(deltas), 3)
+                if deltas
+                else None,
+                "matching_isrcs": sum(
+                    bool(t.isrc and t.isrc in e.tags.get("isrc", []))
+                    for t, e in aligned
                 ),
+                "matching_pcm_checksums": sum(same_pcm(t, e) for t, e in aligned),
             }
         )
         return match
 
-    # Full copy of digital edition IDs requires identity with the release already
-    # in the library. A shared track program alone only supports recording credits.
     same_library = [
         match
         for item in locals_
         if (match := assess(item))
-        and release.medium == item.medium
-        and (
-            barcode_matches(release, item)
-            or any(
-                first(release.tags, key)
-                and first(release.tags, key) == first(item.tags, key)
-                for key in EDITION_IDS - {"barcode", "catalognumber"}
-            )
-        )
+        and (release.medium == item.medium or match.rank >= 110)
+        and any(identifiers(release, item))
     ]
     same_library_sources = {m.edition.source for m in same_library}
     for item in candidates:
@@ -555,19 +738,22 @@ def propose(
             and item["source"] not in same_library_sources
         ):
             item["decision"] = "reference only"
-            item["reason"] += ", but no shared release barcode or edition ID"
-    mb = catalog.musicbrainz(release)
+            item["reason"] += ", but no confirmed local edition identifier"
+    exact_library = [m for m in same_library if m.rank >= 110]
+    mb = [] if exact_library else catalog.musicbrainz(release)
     mb_matches = [match for edition in mb if (match := assess(edition))]
-    links = [match.edition.lookup for match in mb_matches]
-    discogs = catalog.discogs(release, links)
+    links = [
+        edition.lookup for edition in mb if title_matches(edition.title, release.title)
+    ]
+    discogs = [] if exact_library else catalog.discogs(release, links)
     discogs_matches = [match for edition in discogs if (match := assess(edition))]
     # A linked Discogs entry augments the matching MB entry, not a second vote
     # for the same release. Its credits still have to match the track layout.
-    linked = set(links) - {""}
+    linked = {match.edition.lookup for match in mb_matches} - {""}
     matches = mb_matches + [
         m for m in discogs_matches if m.edition.source not in linked
     ]
-    matches = matches or same_library
+    matches = exact_library or matches or same_library
     diagnostics["sources"] = [m.edition.source for m in matches] or [
         item.source for item in mb + discogs
     ]
@@ -579,7 +765,26 @@ def propose(
         for item in candidates:
             if item["source"] in tied:
                 item["decision"] = "ambiguous"
-        raise
+        programs = [
+            m
+            for edition in locals_ + mb + discogs
+            if (m := program_match(release, edition))
+        ]
+        if not programs:
+            raise
+        rank = max(m.rank for m in programs)
+        winners = [m for m in programs if m.rank == rank]
+        if len({(m.edition.medium, m.edition.date) for m in winners}) > 1:
+            raise
+        evidence = winners[0].evidence
+    program_only = winners[0].program_only
+    diagnostics["match_scope"] = (
+        "track program"
+        if program_only
+        else "shared pressings"
+        if len(winners) > 1
+        else "release edition"
+    )
     editions = [m.edition for m in winners]
     preferred = editions[0]
     date = album_date(winners, release.date)
@@ -593,7 +798,7 @@ def propose(
         (
             r.artist
             for r in references
-            if normalize(r.artist) == normalize(release.artist)
+            if artist_key(r.artist) == artist_key(release.artist)
         ),
         release.artist
         if normalize(release.artist) in {normalize(x) for x in preferred.aliases}
@@ -621,18 +826,30 @@ def propose(
             item["decision"] = (
                 "supplemental"
                 if supplemental and item["source"] == supplemental.source
+                else "selected for track program"
+                if program_only
                 else "selected"
             )
+            if program_only:
+                item["edition_reason"] = item["reason"]
+                item["reason"] = evidence
     diagnostics["withheld_release_fields"] = sorted(
         (EDITION_IDS | {"releasecountry"})
         & (
-            set().union(*(m.tags for m in editions))
+            set().union(
+                *(m.tags for m in locals_ + mb + discogs if m.source in sources)
+            )
             - set(album_tags)
             - set(release.tags)
         )
     )
     notes = []
-    if len(editions) > 1:
+    if program_only:
+        notes.append(
+            "The verified track program was used for naming and shared credits. "
+            "Edition-specific fields from the reference were withheld."
+        )
+    elif len(editions) > 1:
         notes.append(
             "Pressing-specific fields are included only when all matching editions agree."
         )

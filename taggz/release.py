@@ -42,6 +42,18 @@ TOC_ROW = re.compile(
     r"^\s*(\d+)\s*\|[^\n|]+\|[^\n|]+\|\s*(\d+)\s*\|\s*(\d+)\s*$",
     re.M,
 )
+WEB_STORES = {
+    "amazon",
+    "amazon music",
+    "apple music",
+    "bandcamp",
+    "beatport",
+    "deezer",
+    "hdtracks",
+    "itunes",
+    "qobuz",
+    "tidal",
+}
 
 
 def normalize(text: str) -> str:
@@ -50,7 +62,11 @@ def normalize(text: str) -> str:
 
 
 def track_key(title: str) -> str:
-    return normalize(FEATURE.sub("", title))
+    title = FEATURE.sub("", title)
+    title = re.sub(
+        r"\s*[\[(](?:album version|bonus track)[)\]]\s*$", "", title, flags=re.I
+    )
+    return normalize(title)
 
 
 def barcode_key(value: str) -> str:
@@ -179,7 +195,7 @@ def read_track(root: Path, path: Path) -> Track:
 
 
 def read_toc(log: str, tracks: list[Track]) -> Toc | None:
-    """Convert a verified EAC track table to the MusicBrainz CD disc ID."""
+    """Convert a verified CD rip track table to the MusicBrainz disc ID."""
     table = TOC_ROW.findall(log.partition("TOC of the extracted CD")[2])
     if len(table) != len(tracks) or not 1 <= len(table) <= 99:
         return None
@@ -220,6 +236,101 @@ def agreed(values: list[str], key, label: str) -> str:
     return values[0] if values else ""
 
 
+def artist_credit(tags: dict[str, list[str]], *keys: str) -> str:
+    for key in keys:
+        artists = [item.strip() for item in tags.get(key, []) if item.strip()]
+        if artists:
+            return ", ".join(artists)
+    return ""
+
+
+def folder_medium(name: str) -> str:
+    qualifiers = [
+        (bracket or parenthesis).strip()
+        for bracket, parenthesis in re.findall(
+            r"\[([^\]]+)\]|\(([^()]*)\)", name.casefold()
+        )
+    ]
+    tail = re.search(
+        r"(?:\s[-—–]\s(web|vinyl|cd)(?:[- ]+flac)?|\s(web|vinyl|cd)[- ]+flac)\s*$",
+        name,
+        re.I,
+    )
+    if tail:
+        qualifiers.append((tail[1] or tail[2]).lower())
+    kinds = {
+        medium
+        for medium, pattern in (
+            ("CD", r"^(?:flac[- ]+cd|cd(?:[- ]?(?:flac|rip))?)\b"),
+            ("Vinyl", r"^(?:vinyl|lp[- ]?rip)\b"),
+            ("Digital Media", r"^(?:web|digital media)\b"),
+        )
+        if any(re.search(pattern, item) for item in qualifiers)
+    }
+    return next(iter(kinds)) if len(kinds) == 1 else ""
+
+
+def valid_gtin(text: str) -> bool:
+    return (
+        len(text) in {8, 12, 13, 14}
+        and text.isascii()
+        and text.isdigit()
+        and any(ch != "0" for ch in text)
+        and sum(
+            int(ch) * (1 if index % 2 == 0 else 3)
+            for index, ch in enumerate(reversed(text))
+        )
+        % 10
+        == 0
+    )
+
+
+def folder_identifiers(name: str) -> tuple[str, str]:
+    blocks = re.findall(r"\{([^{}]+)\}", name)
+    # Bracketed label and catalog hints are common on LP rips. Skip technical
+    # format groups, including years and audio resolution suffixes.
+    for block in re.findall(r"\[([^]]+)\]", name):
+        if re.search(r"\b(?:flac|web|vinyl|cd|khz|bit)\b", block, re.I):
+            continue
+        if valid_gtin(block) or re.search(
+            r"(?:,\s*\d{8,14}|[A-Z]{2,}[- ]\d{3,})$", block, re.I
+        ):
+            blocks.append(block)
+    if not blocks:
+        return "", ""
+    ordered = [block.strip() for block in blocks if re.search(r"\d", block)]
+    if not ordered:
+        return "", ""
+    hint = ordered[0]
+    code = re.search(r"(?<!\d)\d{8,14}$", hint)
+    return hint, code[0] if code and valid_gtin(code[0]) else ""
+
+
+def source_medium(name: str, tags: dict[str, list[str]], cd_log: bool) -> str:
+    media = first(tags, "media", "source").casefold()
+    source = first(tags, "source").casefold()
+    if cd_log or media in {"cd", "compact disc"}:
+        return "CD"
+    hint = folder_medium(name)
+    if hint in {"CD", "Vinyl"} or "vinyl" in media or "vinyl" in source:
+        return hint if hint in {"CD", "Vinyl"} else "Vinyl"
+    if (
+        hint == "Digital Media"
+        or media in {"web", "digital", "digital media"}
+        or (source in WEB_STORES or first(tags, "qobuz_album_id", "hdtracks"))
+    ):
+        return "Digital Media"
+    return ""
+
+
+def ripper_name(log: str) -> str:
+    if "Exact Audio Copy" in log:
+        return "Exact Audio Copy"
+    if "X Lossless Decoder" in log or "XLD extraction logfile" in log:
+        return "XLD"
+    return ""
+
+
 def read_release(root: Path) -> Release:
     entries = snapshot(root)
     paths = [path for path, info in entries.items() if stat.S_ISREG(info[2])]
@@ -242,23 +353,25 @@ def read_release(root: Path) -> Release:
             raise Review(f"disc {disc} has duplicate or missing track numbers")
     album = agreed([first(t.tags, "album") for t in tracks], normalize, "album titles")
     album_artist = agreed(
-        [first(t.tags, "albumartist", "album artist") for t in tracks],
+        [artist_credit(t.tags, "albumartist", "album artist") for t in tracks],
         normalize,
         "album artists",
     )
     fallback_artist, fallback_title = folder_identity(root)
     artist = album_artist or fallback_artist
     if not artist:
-        artist = agreed([first(t.tags, "artist") for t in tracks], normalize, "artists")
+        artist = agreed(
+            [artist_credit(t.tags, "artist") for t in tracks], normalize, "artists"
+        )
     album = album or fallback_title
     if not artist or not album:
         raise Review("missing album title or album artist")
-    existing_barcode = [first(t.tags, "barcode", "upc") for t in tracks]
+    existing_barcode = [first(t.tags, "barcode", "upc", "mcn") for t in tracks]
     cue_barcodes = []
     cue_codes: dict[tuple[int, int], set[str]] = {}
     tocs = []
     rip_logs = {}
-    eac = False
+    cd_log = False
     for path in paths:
         if path.suffix.lower() == ".cue":
             cue = text_file(root / path)
@@ -282,17 +395,18 @@ def read_release(root: Path) -> Release:
         if path.suffix.lower() != ".log":
             continue
         log = text_file(root / path)
-        if "Exact Audio Copy" not in log:
-            rip_logs[path.as_posix()] = "format is not recognized as Exact Audio Copy"
+        ripper = ripper_name(log)
+        if not ripper:
+            rip_logs[path.as_posix()] = "format is not recognized as a CD rip log"
             continue
-        eac = True
+        cd_log = True
         disc = disc_number(path)
         toc = read_toc(log, [t for t in tracks if t.disc == disc])
         rip_logs[path.as_posix()] = (
             f"verified disc {disc} TOC ({toc.id})"
             if toc
             else (
-                f"Exact Audio Copy log found, but the disc {disc} table of contents could not be verified against the FLACs"
+                f"{ripper} log found, but the disc {disc} table of contents could not be verified against the FLACs"
             )
         )
         if toc and toc not in tocs:
@@ -300,36 +414,21 @@ def read_release(root: Path) -> Release:
     if len({toc.disc for toc in tocs}) != len(tocs):
         raise Review("conflicting CD rip logs")
     tag = tracks[0].tags
-    hint = first(tag, "media", "source").casefold()
-    folder = root.name.casefold()
-    if eac or hint == "cd" or "[cd]" in folder:
-        medium = "CD"
-    elif "vinyl" in hint or "[vinyl]" in folder:
-        medium = "Vinyl"
-    elif (
-        hint in {"digital media", "web", "digital"}
-        or "[web]" in folder
-        or first(tag, "qobuz_album_id", "hdtracks")
-    ):
-        medium = "Digital Media"
-    else:
-        medium = ""
+    medium = source_medium(root.name, tag, cd_log)
     catalog = agreed(
         [first(t.tags, "catalognumber", "catalog_number") for t in tracks],
         normalize,
         "catalog numbers",
     )
-    if not catalog:
-        bracket = re.search(r"\{([^{}]+)\}", root.name)
-        if bracket and re.search(r"\d", bracket[1]):
-            catalog = bracket[1]
+    catalog_hint, barcode_hint = folder_identifiers(root.name)
     return Release(
         root,
         artist,
         album,
         first(tag, "date", "year"),
-        agreed(existing_barcode + cue_barcodes, barcode_key, "barcodes"),
-        catalog,
+        agreed(existing_barcode + cue_barcodes, barcode_key, "barcodes")
+        or barcode_hint,
+        catalog or catalog_hint,
         medium,
         tracks,
         tocs,

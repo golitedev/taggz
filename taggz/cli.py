@@ -228,10 +228,25 @@ def render(reports: list[dict], apply: bool) -> None:
             )
             print(f"    {candidate['source']}")
             print(f"    {candidate['reason']}")
+            if edition_reason := candidate.get("edition_reason"):
+                print(f"    Edition check: {edition_reason}")
             if candidate["exact_cd_toc"]:
                 print("    Exact CD disc ID match")
+            facts = []
+            if candidate["compared_durations"]:
+                facts.append(
+                    f"{candidate['compared_durations']} durations compared "
+                    f"(largest difference {candidate['maximum_duration_difference_seconds']:.3f}s)"
+                )
+                facts.append(f"{candidate['matching_isrcs']} matching ISRCs")
+            if candidate["matching_pcm_checksums"]:
+                facts.append(
+                    f"{candidate['matching_pcm_checksums']} identical PCM checksums"
+                )
+            if facts:
+                print("    " + ", ".join(facts))
         if held := row.get("withheld_release_fields"):
-            print(f"  Edition tags left unset (sources disagree): {', '.join(held)}")
+            print(f"  Unverified edition tags left unset: {', '.join(held)}")
         for name in row["library_matches"]:
             print(f"  Library: {name}")
         for name in row.get("unreadable_library_matches", []):
