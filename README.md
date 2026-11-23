@@ -14,6 +14,16 @@ python3 -m taggz.docker --config taggz.toml
 python3 -m taggz.docker --config taggz.toml --apply
 ```
 
+Each push builds and tests a Linux AMD64 image. Successful builds from `main`
+publish `ghcr.io/golitedev/taggz:latest` and a commit-specific tag. To use the
+published image, pull it on the NAS and pass it to the launcher. For a private
+package, log in to GHCR before pulling:
+
+```sh
+docker pull ghcr.io/golitedev/taggz:latest
+python3 -m taggz.docker --image ghcr.io/golitedev/taggz:latest --config taggz.toml
+```
+
 Preview is the default. Docker mounts the library and config read-only in both modes. Staging is read-only in preview. With `--apply`, staging is the only writable data mount. The launcher requires recursive read-only bind support for the library. On Linux this requires kernel 5.12 or newer.
 
 To preview a single album, pass its staging folder name exactly:
