@@ -7,6 +7,7 @@ import tempfile
 import unittest
 import wave
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,7 +15,7 @@ from mutagen.flac import FLAC
 
 from taggz.catalog import Edition, Entry
 from taggz.config import load_config
-from taggz.match import score, select
+from taggz.match import common, score, select
 from taggz.release import Review, read_release, read_toc
 from taggz.storage import Staging, atomic_json, read_header
 
@@ -240,6 +241,65 @@ class Workflow(unittest.TestCase):
         self.assertIsNotNone(score(release, candidate))
         release.root = self.staging / "Artist - Album"
         self.assertIsNone(score(release, candidate))
+
+    def test_exact_cd_toc_accepts_typo_and_extra_track_annotations(self):
+        staged, _ = self.pair()
+        release = read_release(staged.parent)
+        release.medium = "CD"
+        release.barcode = ""
+        original = [
+            "Helpless Automation",
+            "Crazy (Non LP B-Side",
+            "Underground (Live)",
+            "Who Can It Be Now",
+            "Down Under",
+        ]
+        catalog = [
+            "Helpless Automaton",
+            "Bonus Tracks: Crazy",
+            "Underground (live, Brazil 1996)",
+            "Who Can It Be Now",
+            "Down Under",
+        ]
+        release.tracks = [
+            replace(release.tracks[0], number=number, title=title)
+            for number, title in enumerate(original, 1)
+        ]
+        log = "TOC of the extracted CD\n" + "\n".join(
+            f"{pos} | start | length | {(pos - 1) * 75} | {pos * 75 - 1}"
+            for pos in range(1, 6)
+        )
+        toc = read_toc(log, release.tracks)
+        self.assertIsNotNone(toc)
+        release.tocs = [toc]
+        entries = [
+            Entry(1, pos, title, 1.0, {"musicbrainz_trackid": [str(pos)]})
+            for pos, title in enumerate(catalog, 1)
+        ]
+        first = Edition(
+            "Artist",
+            "Album",
+            "2003",
+            "CD",
+            entries,
+            "first",
+            {"musicbrainz_releasegroupid": ["group"]},
+            {(1, toc.id)},
+        )
+        second_entries = entries[:]
+        second_entries[2] = replace(
+            entries[2], tags={"musicbrainz_trackid": ["alternative"]}
+        )
+        second = replace(first, source="second", tracks=second_entries)
+        selected, _ = select([score(release, first), score(release, second)])
+        self.assertEqual(len(selected), 2)
+        self.assertNotIn(
+            "musicbrainz_trackid", common([m.edition.tracks[2].tags for m in selected])
+        )
+        self.assertIsNone(score(release, replace(first, discids=set())))
+        bad = entries[:]
+        bad[2] = replace(entries[2], title="Underground")
+        self.assertIsNone(score(release, replace(first, tracks=bad)))
 
     def test_interrupted_publish_restores_original_on_next_apply(self):
         staged, _ = self.pair()

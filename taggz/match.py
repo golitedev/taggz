@@ -1,5 +1,6 @@
 import re
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from pathlib import Path
 from unicodedata import normalize as unicode_normalize
 from urllib.parse import urlsplit
@@ -121,17 +122,52 @@ def catalog_matches(source: str, target: str) -> bool:
     return bool(a and b and (a == b or (len(b) >= 5 and a.endswith(b))))
 
 
-def layout_matches(release: Release, edition: Edition) -> bool:
-    variant = supported_variant(release, edition)
-    return len(release.tracks) == len(edition.tracks) and all(
-        (a.disc, a.number) == (b.disc, b.number)
-        and (
-            track_key(a.title) == track_key(b.title)
-            or variant
-            and track_key(a.title) == track_key(b.title).removesuffix(variant)
-        )
-        for a, b in zip(release.tracks, edition.tracks, strict=True)
+def cd_title(title: str) -> str:
+    title = re.sub(r"^bonus tracks?\s*:\s*", "", title, flags=re.I)
+    return re.sub(r"\s*\(non[- ]lp\s+b[- ]side\)?\s*$", "", title, flags=re.I)
+
+
+def cd_title_key(title: str) -> str:
+    title = re.sub(r"\(live[,;]\s*[^)]+\)\s*$", "(live)", cd_title(title), flags=re.I)
+    return track_key(title)
+
+
+def exact_cd_toc(release: Release, edition: Edition) -> bool:
+    return (
+        edition.medium == "CD"
+        and len(release.tocs) == release.tracks[-1].disc
+        and all((item.disc, item.id) in edition.discids for item in release.tocs)
     )
+
+
+def layout_matches(
+    release: Release, edition: Edition, *, exact_toc: bool = False
+) -> bool:
+    if len(release.tracks) != len(edition.tracks):
+        return False
+    variant = supported_variant(release, edition)
+    typos = 0
+    for source, target in zip(release.tracks, edition.tracks, strict=True):
+        if (source.disc, source.number) != (target.disc, target.number):
+            return False
+        left, right = track_key(source.title), track_key(target.title)
+        if left == right or (variant and right == left + variant):
+            continue
+        if not exact_toc:
+            return False
+        left, right = cd_title_key(source.title), cd_title_key(target.title)
+        if left == right:
+            continue
+        if (
+            typos
+            or min(len(left), len(right)) < 8
+            or re.findall(r"\d+", left) != re.findall(r"\d+", right)
+            or left.endswith("live") != right.endswith("live")
+            or SequenceMatcher(None, left, right).ratio() < 0.94
+        ):
+            return False
+        typos += 1
+    return True
 
 
 def barcode_matches(release: Release, edition: Edition) -> bool:
@@ -154,7 +190,8 @@ def score(release: Release, edition: Edition) -> Match | None:
     )
     if normalize(release.artist) not in aliases or not title_matches_edition:
         return None
-    if not layout_matches(release, edition):
+    toc = exact_cd_toc(release, edition)
+    if not layout_matches(release, edition, exact_toc=toc):
         return None
     if (
         release.barcode
@@ -174,11 +211,6 @@ def score(release: Release, edition: Edition) -> Match | None:
         if track.isrc and track.isrc in entry.tags.get("isrc", []):
             isrc_votes += 1
 
-    toc = (
-        bool(release.tocs)
-        and len(release.tocs) == release.tracks[-1].disc
-        and all((item.disc, item.id) in edition.discids for item in release.tocs)
-    )
     barcode = barcode_matches(release, edition)
     catalog = any(
         catalog_matches(release.catalog, code)
@@ -352,17 +384,19 @@ def select(matches: list[Match]) -> tuple[list[Match], str]:
         tuple(first(t.tags, "musicbrainz_trackid") for t in m.edition.tracks)
         for m in winners
     ]
+    agreed_recordings = sum(
+        bool(ids[0]) and len(set(ids)) == 1 for ids in zip(*recordings, strict=True)
+    )
     if (
         best < 100
         or len(groups) != 1
         or "" in groups
-        or any(not item for item in recordings[0])
-        or len(set(recordings)) != 1
+        or agreed_recordings * 5 < len(recordings[0]) * 4
     ):
         raise Review(
             "multiple plausible editions; verify the pressing, catalog number, or identifiers"
         )
-    return winners, "shared CD table of contents and recording IDs"
+    return winners, "shared CD table of contents and recording agreement"
 
 
 def safe_name(value: str, limit: int = 245) -> str:
@@ -480,6 +514,7 @@ def propose(release: Release, library: Library, catalog: Catalog) -> Proposal:
         notes.append(
             "Pressing-specific fields are included only when all matching editions agree."
         )
+    shared_cd_layout = all(exact_cd_toc(release, edition) for edition in editions)
     tracks = []
     for idx, track in enumerate(release.tracks):
         records = [m.tracks[idx] for m in editions]
@@ -487,6 +522,14 @@ def propose(release: Release, library: Library, catalog: Catalog) -> Proposal:
         title = (
             records[0].title if len({r.title for r in records}) == 1 else track.title
         )
+        if shared_cd_layout:
+            catalog_titles = [cd_title(r.title) for r in records]
+            if len({track_key(t) for t in catalog_titles}) == 1:
+                title = catalog_titles[0]
+            elif len({cd_title_key(t) for t in catalog_titles}) == 1:
+                title = min(catalog_titles, key=len)
+            else:
+                title = cd_title(title)
         track_sources = sources[:]
         if supplemental:
             for key in CREDITS:
